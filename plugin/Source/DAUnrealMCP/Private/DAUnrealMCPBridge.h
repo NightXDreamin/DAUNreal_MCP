@@ -6,6 +6,7 @@
 #include "HAL/Runnable.h"
 #include "HAL/RunnableThread.h"
 #include "HAL/ThreadSafeBool.h"
+#include "HAL/CriticalSection.h"
 
 class FSocket;
 
@@ -44,9 +45,12 @@ public:
 
 private:
 	bool ProcessConnection(FSocket* ClientSocket);
+	void ClearActiveSocket();
 	TSharedPtr<FDaMCPExecResult> ExecuteOnGameThread(const FString& Code);
 
 	FSocket* ListenerSocket = nullptr;
+	FSocket* ActiveClientSocket = nullptr;
+	FCriticalSection SocketLock;
 	FRunnableThread* Thread = nullptr;
 	FThreadSafeBool bRunning;
 	FThreadSafeBool bStopping;

@@ -28,6 +28,7 @@ DA_PRELUDE = '''\
 # === auto-injected da helpers (DAUnreal MCP) ===
 if "da" not in globals():
     import json as _da_json
+    import unreal  # ensure unreal is loaded and protected before snapshotting
     _da_protected = set(globals())
 
     class _Da:
@@ -104,7 +105,7 @@ if "da" not in globals():
                 del globals()[_k]
 
     da = _Da()
-    _da_protected.update(("_Da", "da", "_da_json", "_da_protected"))
+    _da_protected.update(("_Da", "da", "_da_json", "_da_protected", "unreal"))
 # === end da helpers ===
 '''
 

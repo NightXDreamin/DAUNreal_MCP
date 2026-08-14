@@ -78,11 +78,20 @@ namespace
 		Buffer[Length] = '\n';
 
 		int32 Sent = 0;
-		if (!Socket->Send(Buffer.GetData(), Buffer.Num(), Sent))
+		while (Sent < Buffer.Num())
 		{
-			return false;
+			int32 BytesSent = 0;
+			if (!Socket->Send(Buffer.GetData() + Sent, Buffer.Num() - Sent, BytesSent))
+			{
+				return false;
+			}
+			if (BytesSent <= 0)
+			{
+				return false;
+			}
+			Sent += BytesSent;
 		}
-		return Sent == Buffer.Num();
+		return true;
 	}
 
 	/** Serialize a JSON object to a single line (no whitespace), for NDJSON framing. */
@@ -170,17 +179,28 @@ void FDAUnrealMCPBridge::Shutdown()
 	bStopping = true;
 	bRunning = false;
 
-	if (ListenerSocket)
+	// Unblock a worker thread stuck in ReadLine() on the active client socket.
 	{
-		ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(ListenerSocket);
-		ListenerSocket = nullptr;
+		FScopeLock Lock(&SocketLock);
+		if (ActiveClientSocket)
+		{
+			ActiveClientSocket->Close();
+		}
 	}
 
+	// Join the worker BEFORE touching the listener socket, so we never destroy the
+	// listener while the worker may still be inside HasPendingConnection/Accept.
 	if (Thread)
 	{
 		Thread->WaitForCompletion();
 		delete Thread;
 		Thread = nullptr;
+	}
+
+	if (ListenerSocket)
+	{
+		ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(ListenerSocket);
+		ListenerSocket = nullptr;
 	}
 }
 
@@ -194,6 +214,12 @@ uint32 FDAUnrealMCPBridge::Run()
 			FSocket* ClientSocket = ListenerSocket->Accept(TEXT("DAUnrealMCPClient"));
 			if (ClientSocket)
 			{
+				if (bStopping)
+				{
+					ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(ClientSocket);
+					break;
+				}
+
 				int32 BufferSize = 65536;
 				ClientSocket->SetReceiveBufferSize(BufferSize, BufferSize);
 				ClientSocket->SetSendBufferSize(BufferSize, BufferSize);
@@ -212,11 +238,23 @@ uint32 FDAUnrealMCPBridge::Run()
 	return 0;
 }
 
+void FDAUnrealMCPBridge::ClearActiveSocket()
+{
+	FScopeLock Lock(&SocketLock);
+	ActiveClientSocket = nullptr;
+}
+
 bool FDAUnrealMCPBridge::ProcessConnection(FSocket* ClientSocket)
 {
+	{
+		FScopeLock Lock(&SocketLock);
+		ActiveClientSocket = ClientSocket;
+	}
+
 	FString Line;
 	if (!ReadLine(ClientSocket, Line))
 	{
+		ClearActiveSocket();
 		return false;
 	}
 
@@ -225,6 +263,7 @@ bool FDAUnrealMCPBridge::ProcessConnection(FSocket* ClientSocket)
 	if (!FJsonSerializer::Deserialize(Reader, ReqObj) || !ReqObj.IsValid())
 	{
 		SendErrorResponse(ClientSocket, 0, TEXT("invalid JSON request"));
+		ClearActiveSocket();
 		return true;
 	}
 
@@ -232,6 +271,12 @@ bool FDAUnrealMCPBridge::ProcessConnection(FSocket* ClientSocket)
 	const FString Code = ReqObj->GetStringField(TEXT("code"));
 
 	TSharedPtr<FDaMCPExecResult> R = ExecuteOnGameThread(Code);
+	if (!R.IsValid())
+	{
+		// Bridge is shutting down and the game thread asked us to abort.
+		ClearActiveSocket();
+		return false;
+	}
 
 	TSharedRef<FJsonObject> Resp = MakeShareable(new FJsonObject());
 	Resp->SetNumberField(TEXT("id"), Id);
@@ -258,7 +303,9 @@ bool FDAUnrealMCPBridge::ProcessConnection(FSocket* ClientSocket)
 		Resp->SetStringField(TEXT("error"), Err);
 	}
 
-	return SendLine(ClientSocket, SerializeCondensed(Resp));
+	const bool bSent = SendLine(ClientSocket, SerializeCondensed(Resp));
+	ClearActiveSocket();
+	return bSent;
 }
 
 TSharedPtr<FDaMCPExecResult> FDAUnrealMCPBridge::ExecuteOnGameThread(const FString& Code)
@@ -308,5 +355,15 @@ TSharedPtr<FDaMCPExecResult> FDAUnrealMCPBridge::ExecuteOnGameThread(const FStri
 		Promise->SetValue(R);
 	});
 
+	// Poll instead of blocking forever, so Shutdown() on the game thread can never
+	// deadlock against this worker thread waiting for the game thread to run the lambda.
+	while (!Future.IsReady())
+	{
+		if (bStopping)
+		{
+			return nullptr;
+		}
+		FPlatformProcess::Sleep(0.002f);
+	}
 	return Future.Get();
 }
