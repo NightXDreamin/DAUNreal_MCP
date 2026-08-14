@@ -1,0 +1,30 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "DAUnreal MCP Bridge",
+	"Description": "Local TCP bridge that executes Python scripts in the Unreal Editor Python VM, for use by the DAUnreal MCP server.",
+	"Category": "Scripting",
+	"CreatedBy": "DAUnreal MCP",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Plugins": [
+		{
+			"Name": "PythonScriptPlugin",
+			"Enabled": true
+		}
+	],
+	"Modules": [
+		{
+			"Name": "DAUnrealMCP",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
+		}
+	]
+}

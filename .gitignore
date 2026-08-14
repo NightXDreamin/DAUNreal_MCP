@@ -1,0 +1,40 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+build/
+dist/
+
+# ---- Unreal Engine ----
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+*.pdb
+*.obj
+*.lib
+*.exp
+
+# ---- This repo's compiled plugin output ----
+build_out/
+
+# ---- IDE / editors ----
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- Reasonix session data ----
+.reasonix/
