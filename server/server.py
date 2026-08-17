@@ -10,16 +10,28 @@ business toolset) around a script pass-through:
 Run with:  python server.py
 """
 
+import asyncio
 import json
+import os
+import re
 import socket
 import threading
 
+import anyio
 from mcp.server import MCPServer
+from mcp.server.mcpserver.context import Context
+
+import da_async
 
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8765
+# Overridable so multiple editors (e.g. a 5.4 project on 8765 and a 5.5
+# project on 8766) can each run a server instance:
+#   set DAUNREAL_MCP_PORT=8766
+DEFAULT_PORT = int(os.environ.get("DAUNREAL_MCP_PORT", "8765"))
 CONNECT_TIMEOUT = 5.0   # short: connection refused => editor not running
 READ_TIMEOUT = 300.0    # long: scripts run synchronously on the game thread
+POLL_INTERVAL = 0.5     # async: how often to poll a running job
+ASYNC_TIMEOUT = 600.0   # async: hard cap before we cancel the job
 
 # --- helpers auto-injected into the editor's shared Python namespace ---
 # Defined once (guarded by `if "da" not in globals()`), and persists across
@@ -148,14 +160,15 @@ class UEBridge:
                 data += chunk
         return data.decode("utf-8")
 
-    def execute(self, code: str) -> dict:
+    def _request(self, payload: dict) -> dict:
         with self._lock:
             request_id = self._next_id()
+            payload = dict(payload)
+            payload["id"] = request_id
             sock: socket.socket | None = None
             try:
                 sock = self._connect()
-                payload = (json.dumps({"id": request_id, "code": code}) + "\n").encode("utf-8")
-                sock.sendall(payload)
+                sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
                 return json.loads(self._read_line(sock))
             except ConnectionRefusedError:
                 return {
@@ -189,6 +202,23 @@ class UEBridge:
                     except OSError:
                         pass
 
+    def execute(self, code: str) -> dict:
+        return self._request({"code": code})
+
+    def submit_async(self, setup_code: str, step_code: str) -> dict:
+        return self._request({
+            "action": "execute",
+            "mode": "async",
+            "setup_code": setup_code,
+            "step_code": step_code,
+        })
+
+    def poll(self, job_id: int) -> dict:
+        return self._request({"action": "poll", "job_id": job_id})
+
+    def cancel(self, job_id: int) -> dict:
+        return self._request({"action": "cancel", "job_id": job_id})
+
 
 bridge = UEBridge()
 
@@ -218,8 +248,93 @@ def _format(resp: dict) -> str:
     return "\n".join(lines)
 
 
+async def _run_async(code: str, ctx: Context) -> str:
+    """Async path: transform -> submit -> poll with progress -> final result."""
+    try:
+        transformed = da_async.transform(code)
+    except SyntaxError as exc:
+        return f"ERROR: SyntaxError at line {exc.lineno}: {exc.msg}"
+
+    if not transformed.steppable:
+        # No loops -> nothing to chunk; fall back to plain sync execution.
+        return _format(_run(code))
+
+    # Ensure the `da` helpers exist in the shared namespace before the job runs.
+    # The prelude cannot be prepended to setup_code: that string is the output of
+    # the AST transform, and re-parsing it would wrap the helpers in the generator
+    # (and inject yields into their loops). It is idempotent and cheap, so send it
+    # as its own request instead.
+    prelude_resp = bridge.execute(DA_PRELUDE)
+    if not prelude_resp.get("ok"):
+        return f"ERROR: {prelude_resp.get('error', 'failed to inject da helpers')}"
+
+    resp = bridge.submit_async(transformed.setup_code, transformed.step_code)
+    if not resp.get("ok"):
+        return f"ERROR: {resp.get('error', 'async submit failed')}"
+
+    job_id = resp.get("job_id")
+    last_slices = 0
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + ASYNC_TIMEOUT
+
+    try:
+        while True:
+            await asyncio.sleep(POLL_INTERVAL)
+
+            p = bridge.poll(job_id)
+            if not p.get("ok"):
+                return f"ERROR: {p.get('error', 'poll failed')}"
+
+            slices = p.get("slices_done", 0)
+            if slices != last_slices:
+                await ctx.report_progress(float(slices), None, f"{slices} slices")
+                last_slices = slices
+
+            status = p.get("status")
+            if status == "done":
+                return _format_async_result(p)
+            if status == "error":
+                return f"ERROR: {_map_traceback(p.get('error') or 'unknown error', transformed.line_map)}"
+            if status == "cancelled":
+                output = (p.get("output") or "").strip()
+                return f"CANCELLED\n{output}".rstrip() if output else "CANCELLED"
+
+            if loop.time() > deadline:
+                bridge.cancel(job_id)
+                return "ERROR: async job timed out and was cancelled"
+    except asyncio.CancelledError:
+        # Client cancelled the request (notifications/cancelled, interrupt
+        # mode). Cancel the editor job inside a shielded scope so the cleanup
+        # (g.close() -> GeneratorExit -> finally) completes.
+        with anyio.CancelScope(shield=True):
+            bridge.cancel(job_id)
+            cancel_deadline = loop.time() + 5.0
+            while loop.time() < cancel_deadline:
+                await asyncio.sleep(0.2)
+                p = bridge.poll(job_id)
+                if p.get("status") == "cancelled":
+                    break
+        return "CANCELLED"
+
+
+def _format_async_result(poll_resp: dict) -> str:
+    output = (poll_resp.get("output") or "").strip()
+    return f"OK\n{output}".rstrip() if output else "OK"
+
+
+def _map_traceback(error: str, line_map: dict) -> str:
+    if not line_map:
+        return error
+
+    def _replace(match: re.Match) -> str:
+        new_line = da_async.map_traceback_line(int(match.group(1)), line_map)
+        return f'File "<string>", line {new_line}'
+
+    return re.sub(r'File "<string>", line (\d+)', _replace, error)
+
+
 @server.tool()
-def execute_python(code: str) -> str:
+async def execute_python(code: str, ctx: Context, mode: str = "sync") -> str:
     """Execute a Python script inside the running Unreal Editor.
 
     The script runs with full access to the ``unreal`` module and its namespace
@@ -229,6 +344,16 @@ def execute_python(code: str) -> str:
     UObjects/structs/arrays into readable dicts/JSON, ``da.u(path)`` loads an
     asset, ``da.selected()`` / ``da.all_actors()`` list level actors.
 
+    ``mode``: ``"sync"`` (default) runs the whole script in one go; ``"async"``
+    splits loops into time-budgeted steps so long batch scripts do not freeze
+    the editor, reports progress slices, and honours client cancellation.
+
+    Async chunking only applies to *top-level* loops. Put the loop at the top
+    level of the script (not inside a ``def``/``class``). If a script has no
+    splittable top-level loop — a loop inside a function, a single giant
+    blocking call, or only comprehensions — it falls back to sync execution and
+    will block the editor until it finishes.
+
     Prefer non-deprecated editor APIs, e.g.:
         subsys = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
         actors = subsys.get_all_level_actors()
@@ -237,7 +362,9 @@ def execute_python(code: str) -> str:
     """
     if not code or not code.strip():
         return "Error: code is empty."
-    return _format(_run(code))
+    if mode != "async":
+        return _format(_run(code))
+    return await _run_async(code, ctx)
 
 
 @server.tool()
@@ -269,6 +396,50 @@ else:
 
 
 @server.tool()
+def python_search(keyword: str) -> str:
+    """Fuzzy-search the ``unreal`` module namespace for names containing the
+    keyword (case-insensitive).
+
+    Returns matching top-level classes and functions, grouped and capped. Use it
+    when you don't know the exact API name; follow up with
+    ``python_help("unreal.<ClassName>")`` to list a class's members.
+
+    Note: this searches *top-level* names only — a method like
+    ``spawn_actor_from_class`` lives on ``EditorActorSubsystem``, so search the
+    class name (e.g. ``python_search("editoractor")``) then inspect it.
+
+    Example:  python_search("asset")  ->  EditorAssetSubsystem, load_asset, ...
+    """
+    if not keyword or not keyword.strip():
+        return "Error: keyword is empty."
+
+    script = f'''\
+import unreal
+_kw = {keyword!r}.lower()
+_classes = []
+_others = []
+for _n in dir(unreal):
+    if _kw not in _n.lower():
+        continue
+    _obj = getattr(unreal, _n)
+    (_classes if isinstance(_obj, type) else _others).append(_n)
+_classes.sort()
+_others.sort()
+def _show(_title, _names, _limit):
+    print(_title + " (%d):" % len(_names))
+    if not _names:
+        print("  (none)")
+        return
+    print("  " + ", ".join(_names[:_limit]))
+    if len(_names) > _limit:
+        print("  ... and %d more" % (len(_names) - _limit))
+_show("CLASSES", _classes, 40)
+_show("FUNCTIONS/OTHER", _others, 40)
+'''
+    return _format(_run(script, prelude=False))
+
+
+@server.tool()
 def reset_session() -> str:
     """Clear user-defined variables from the shared REPL namespace.
 
@@ -276,6 +447,180 @@ def reset_session() -> str:
     gets cluttered or a variable is interfering.
     """
     return _format(_run("da.reset(); print('session namespace reset')"))
+
+
+# --------------------------------------------------------------------------- #
+# knowledge-layer resources (readable by the client on demand, no tool slot)
+# --------------------------------------------------------------------------- #
+
+@server.resource(
+    "daunreal://subsystems",
+    name="subsystems",
+    title="常用 Editor Subsystem 对照表",
+    description="常用 unreal.Editor*Subsystem 的用途与关键方法（unreal.get_editor_subsystem() 获取）。",
+)
+def subsystems_resource() -> str:
+    return """\
+# 常用 Editor Subsystem 对照表
+
+统一获取方式：`sub = unreal.get_editor_subsystem(unreal.<类名>)`
+
+## 关卡 Actor 操作
+- **EditorActorSubsystem** — spawn / 删除 / 复制 / 选择 / 移动 actor
+  - `get_all_level_actors()` / `get_selected_level_actors()`
+  - `spawn_actor_from_class(cls, loc, rot)` / `spawn_actor_from_object(obj, loc, rot)`
+  - `destroy_actor(actor)` / `destroy_actors(list)`
+  - `duplicate_actor(actor, offset, is_world_space)` / `clear_actor_selection_set()`
+
+## 资产操作（替代 EditorAssetLibrary）
+- **EditorAssetSubsystem** — 资产 CRUD
+  - `load_asset(path)` / `does_asset_exist(path)` / `do_assets_exist(list)`
+  - `save_asset(path)` / `save_loaded_asset(obj)`
+  - `delete_asset(path)` / `delete_loaded_asset(obj)`
+  - `duplicate_asset(src, dst)` / `rename_asset(src, dst)` / `find_asset_data(path)`
+
+## 关卡 / 编辑器状态
+- **LevelEditorSubsystem** — 关卡操作 + PIE
+  - `get_current_level()` / `save_current_level()` / `save_all_dirty_levels()`
+  - `new_level(path)` / `load_level(path)`
+  - `editor_play_simulate()` / `editor_request_begin_play()` / `editor_request_end_play()`
+  - `build_light_maps()` / `eject_pilot_level_actor()`
+- **UnrealEditorSubsystem** — 获取 world / 视口
+  - `get_editor_world()` / `get_game_world()` / `get_world()`
+  - `get_level_viewport_camera_info()`
+
+## 网格资产编辑
+- **StaticMeshEditorSubsystem** — 静态网格（替代 EditorStaticMeshLibrary）
+  - `get_lod_count(mesh)` / `get_lod_build_settings(mesh, lod)` / `set_lods(...)`
+  - `add_simple_collisions(mesh)` / `add_uv_channel(mesh, lod)`
+- **SkeletalMeshEditorSubsystem** — 骨骼网格（替代 EditorSkeletalMeshLibrary）
+  - `get_lod_count(mesh)` / `create_physics_asset(mesh)` / `assign_physics_asset(...)`
+
+## 其他
+- **EditorUtilitySubsystem** — 运行 Editor Utility Widget/Blueprint：`spawn_and_register_tab(...)` / `close_tab_by_id(id)` / `does_tab_exist(id)`
+- **AssetEditorSubsystem** — 打开/关闭资产编辑器：`open_editor_for_assets(list)` / `close_all_editors_for_asset(asset)`
+- **EditorValidatorSubsystem** — 数据校验（资产 / actor 规则）
+"""
+
+
+@server.resource(
+    "daunreal://deprecated-api",
+    name="deprecated-api",
+    title="废弃 API → 新 API 映射",
+    description="EditorScriptingUtilities 的 Editor*Library 已废弃，对应改用 Editor*Subsystem。",
+)
+def deprecated_api_resource() -> str:
+    return """\
+# 废弃 API → 新 API 映射
+
+`EditorScriptingUtilities` 插件的 `Editor*Library` 在 5.5 已废弃（仍可用但告警）。
+优先用 `unreal.get_editor_subsystem(unreal.<Subsystem>)`。
+
+## EditorLevelLibrary → EditorActorSubsystem / LevelEditorSubsystem / UnrealEditorSubsystem
+- `get_all_level_actors()` → `EditorActorSubsystem.get_all_level_actors()`
+- `get_selected_level_actors()` → `EditorActorSubsystem.get_selected_level_actors()`
+- `spawn_actor_from_class()` → `EditorActorSubsystem.spawn_actor_from_class()`
+- `destroy_actor()` → `EditorActorSubsystem.destroy_actor()`
+- `get_editor_world()` → `UnrealEditorSubsystem.get_editor_world()`
+- `load_level()` / `save_current_level()` → `LevelEditorSubsystem.*`
+
+## EditorAssetLibrary → EditorAssetSubsystem
+- `load_asset` / `delete_asset` / `save_asset` / `duplicate_asset` / `rename_asset` / `does_asset_exist` / `find_asset_data` → `EditorAssetSubsystem` 同名方法
+
+## EditorStaticMeshLibrary → StaticMeshEditorSubsystem
+- `get_lod_count` / `add_simple_collisions` / `set_lods` → 同名方法
+
+## EditorSkeletalMeshLibrary → SkeletalMeshEditorSubsystem
+- `get_lod_count` / `create_physics_asset` / `regenerate_lod` → 同名方法
+"""
+
+
+@server.resource(
+    "daunreal://conventions",
+    name="conventions",
+    title="DAUnreal MCP 工程约定",
+    description="本 MCP 的使用约定：脚本直通、da helper、REPL 持久化、async、Undo 事务。",
+)
+def conventions_resource() -> str:
+    return """\
+# DAUnreal MCP 工程约定
+
+- **脚本直通**：`execute_python` 直接执行 `unreal.*` Python，能力上限 = 整个 `unreal` API（本 MCP 不堆预置 tool）。
+- **da helper（自动注入）**：
+  - `da.dump(obj, depth=3)` / `da.dumps(obj, depth=3)` — UObject/struct/数组 → dict/JSON
+  - `da.u(path)` 加载资产；`da.cls(name)` 加载类
+  - `da.selected()` / `da.all_actors()` — 当前选择 / 全部关卡 actor
+  - `da.reset()` — 清空用户变量（保留 `unreal` 和 `da`）
+- **REPL 持久化**：变量与 `import` 跨 `execute_python` 调用保留。
+- **输出**：用 `print(...)` 返回结果。
+- **异步**：`mode="async"` 时循环放顶层（不在函数/类内、非纯 comprehension）才能分片；否则回退 sync 并阻塞编辑器。
+- **Undo**：每次执行包 `FScopedTransaction`，改错可 Ctrl+Z 回滚。
+- **API 选择**：优先 `Editor*Subsystem`（`unreal.get_editor_subsystem`），避免废弃的 `Editor*Library`。
+"""
+
+
+# --------------------------------------------------------------------------- #
+# script templates (prompts the client can fetch to guide the AI)
+# --------------------------------------------------------------------------- #
+
+@server.prompt(
+    name="batch-process-assets",
+    title="批量处理资产模板",
+    description="批量遍历并处理资产（async 分片写法 + AssetRegistry + EditorAssetSubsystem）。",
+)
+def batch_process_assets() -> str:
+    return """\
+Write a script to batch-process assets in the Unreal Editor, then run it with
+`execute_python(code, mode="async")`.
+
+Key points:
+- Put the loop at the TOP LEVEL of the script so `mode="async"` can split it into
+  time-budgeted steps (a loop inside a function or a bare comprehension falls back
+  to sync and freezes the editor).
+- List assets via the AssetRegistry (non-deprecated):
+      reg = unreal.AssetRegistryHelpers.get_asset_registry()
+      assets = reg.get_all_assets()          # list[AssetData]
+- Each AssetData exposes package_name / asset_name / asset_class; load with:
+      path = str(a.package_name) + "." + str(a.asset_name)
+      asset = unreal.load_asset(path)        # None if not loadable
+- Inspect UObjects with da.dumps(obj); report progress with print(...).
+
+Template:
+    import unreal
+    reg = unreal.AssetRegistryHelpers.get_asset_registry()
+    for a in reg.get_all_assets():
+        path = str(a.package_name) + "." + str(a.asset_name)
+        asset = unreal.load_asset(path)
+        # ... process asset ...
+        print("processed", path)
+"""
+
+
+@server.prompt(
+    name="scene-inspection",
+    title="场景巡检模板",
+    description="遍历当前关卡 actor 并输出可读摘要（EditorActorSubsystem + da.dump）。",
+)
+def scene_inspection() -> str:
+    return """\
+Write a script to inspect the current level's actors, then run it with
+`execute_python(code)`.
+
+Key points:
+- Use EditorActorSubsystem (non-deprecated):
+      subsys = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+      actors = subsys.get_all_level_actors()
+- Turn each actor into readable JSON with da.dumps(actor, depth=2).
+- Print a summary (count, classes, names).
+
+Template:
+    import unreal
+    subsys = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    actors = subsys.get_all_level_actors()
+    print("actor count:", len(actors))
+    for a in actors:
+        print(da.dumps(a, depth=2))
+"""
 
 
 if __name__ == "__main__":

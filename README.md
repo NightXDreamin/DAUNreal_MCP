@@ -9,6 +9,8 @@
 - **脚本直通 (Script Pass-through)**：核心工具 `execute_python` 在 UE 编辑器 Python VM 直接执行任意 Python 脚本，让 AI 自由调用完整的 `unreal.*` API，而非受限的预定义工具集。
 - **游戏线程执行 + 命名空间持久化**：插件以 `EPythonFileExecutionScope::Public` 在游戏线程同步执行，变量与 import 跨调用持久化（REPL 风格），会话状态可复用。
 - **Undo 事务包裹**：每次脚本执行用 `FScopedTransaction` 包裹，AI 改场景/资产后可在编辑器内 Ctrl+Z 回滚（对齐 DAMaya_MCP 的 undo chunk）。
+- **异步执行 + 进度 + 取消**：`execute_python(mode="async")` 用 AST 给循环注入 `yield`、把脚本包成 generator，游戏线程按 4ms 时间预算逐帧推进——长批量任务不再冻结编辑器；进度（slices 数）经 `report_progress` 上报，客户端可随时取消（`g.close()` 触发 `finally`、事务正确结束）。
+- **知识层（resource + prompt + 搜索）**：内置 Subsystem 对照表 / 废弃 API 映射 / 工程约定三个 resource，批量资产、场景巡检脚本模板，以及 `python_search` 命名空间模糊搜索，让 AI 少猜 API、写脚本更稳。
 - **内置 `da` 序列化 helper**：自动注入编辑器命名空间，`da.dump` / `da.dumps` 将 UObject / struct / 数组转成可读 dict / JSON。
 - **API 内省工具**：`python_help` 通过 `dir` + docstring 帮助 AI 在写脚本前发现 `unreal` API，降低试错成本。
 - **本地回环 TCP 桥**：C++ 插件在 `127.0.0.1:8765` 提供 NDJSON-over-TCP 桥，仅监听回环地址，无外网暴露。
@@ -40,6 +42,12 @@ powershell -ExecutionPolicy Bypass -File .\deploy.ps1 -ProjectDir "C:\...\DAUNre
 ```ini
 [DAUnrealMCP]
 Port=8765
+```
+
+server 端通过环境变量 `DAUNREAL_MCP_PORT` 指定要连的端口（默认 8765），多编辑器实例（如 5.4 工程 8765、5.5 工程 8766）可各跑一个 server：
+
+```powershell
+$env:DAUNREAL_MCP_PORT = "8766"; python server\server.py
 ```
 
 ### 3. 创建虚拟环境并安装依赖
@@ -91,9 +99,19 @@ server\.venv\Scripts\python.exe server\test_bridge.py "unreal.log('hello from MC
 ## 🛠️ 工具列表
 
 ### 脚本执行与内省
-- `execute_python(code)`：核心直通通道。在 UE 编辑器 Python VM 执行任意 Python 脚本，命名空间跨调用持久化（REPL 风格），自动注入 `da` helper。使用 `print(...)` 返回输出。
+- `execute_python(code, mode="sync")`：核心直通通道。在 UE 编辑器 Python VM 执行任意 Python 脚本，命名空间跨调用持久化（REPL 风格），自动注入 `da` helper。使用 `print(...)` 返回输出。`mode="async"` 时脚本循环被切成时间预算分片逐帧执行（长任务不冻结编辑器），进度经 MCP `report_progress` 上报，支持客户端取消。
 - `python_help(target)`：内省对象 / 类 / 函数，返回类型、公开成员（`dir`）与 docstring，用于写脚本前发现 `unreal` API。
+- `python_search(keyword)`：在 `unreal` 模块命名空间模糊搜索（大小写不敏感）类名与顶层函数名，让 AI 从「不知道类名」到「找到候选类」。
 - `reset_session()`：清空共享命名空间中的用户变量，保留 `unreal` 与 `da` helper。
+
+### 知识层 resource（客户端可主动读取，不占 tool 槽位）
+- `daunreal://subsystems`：常用 Editor Subsystem 对照表（`EditorActorSubsystem` / `EditorAssetSubsystem` / `LevelEditorSubsystem` / `UnrealEditorSubsystem` / `StaticMeshEditorSubsystem` 等，含用途与关键方法）。
+- `daunreal://deprecated-api`：废弃 `Editor*Library` → 新 `Editor*Subsystem` 映射。
+- `daunreal://conventions`：本工程约定（脚本直通、`da` helper、REPL 持久化、async 顶层循环、Undo 事务）。
+
+### 脚本模板 prompt
+- `batch-process-assets`：批量遍历并处理资产（async 分片 + AssetRegistry + EditorAssetSubsystem）。
+- `scene-inspection`：遍历当前关卡 actor 输出可读摘要（EditorActorSubsystem + `da.dump`）。
 
 ### 内置 `da` helper
 - `da.dump(obj, depth=3)` / `da.dumps(obj, depth=3)`：UObject / struct / 数组 → 可读 dict / JSON。

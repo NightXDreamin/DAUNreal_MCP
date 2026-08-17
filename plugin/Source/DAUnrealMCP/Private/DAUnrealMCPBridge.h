@@ -3,10 +3,11 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Containers/Ticker.h"
+#include "HAL/CriticalSection.h"
 #include "HAL/Runnable.h"
 #include "HAL/RunnableThread.h"
 #include "HAL/ThreadSafeBool.h"
-#include "HAL/CriticalSection.h"
 
 class FSocket;
 
@@ -19,6 +20,33 @@ struct FDaMCPExecResult
 	FString Error;
 };
 
+/** Lifecycle state of an async script job (mirrors DA_MCP_STATE in server/da_async.py). */
+enum class EDaMCPJobState
+{
+	Running,
+	Done,
+	Error,
+	Cancelled,
+};
+
+/**
+ * One async job: drives the transformed generator (server/da_async.py) on the
+ * game thread via FTSTicker — one time-budgeted step per tick — so long batch
+ * scripts no longer freeze the editor. The step script prints a
+ * "DA_MCP_STATE|{state}|{slices}" line that we parse into job state.
+ */
+struct FDaMCPJob
+{
+	int32 JobId = 0;
+	EDaMCPJobState State = EDaMCPJobState::Running;
+	FString StepCode;     // executed each tick until the job finishes
+	FString CancelCode;   // closes the generator (_da_gen.close())
+	FThreadSafeBool bCancelRequested;
+	int32 SlicesDone = 0;
+	FString Error;
+	FString Output;   // accumulated non-status output (prints) of the job
+};
+
 /**
  * Local NDJSON-over-TCP bridge. Runs its own worker thread with a polling accept
  * loop (mirrors the proven Mochi/FMochiHttpServer pattern), serving ONE request
@@ -28,6 +56,13 @@ struct FDaMCPExecResult
  * Python execution uses EPythonFileExecutionScope::Public so the namespace
  * (variables/imports) persists across requests regardless of the TCP connection
  * being short-lived.
+ *
+ * Request protocol (newline-delimited JSON):
+ *   sync   : {"id":N, "code":"..."}                          (backwards-compatible)
+ *   async  : {"id":N, "action":"execute", "mode":"async",
+ *             "setup_code":"...", "step_code":"..."}
+ *   poll   : {"id":N, "action":"poll", "job_id":M}
+ *   cancel : {"id":N, "action":"cancel", "job_id":M}
  */
 class FDAUnrealMCPBridge : public FRunnable
 {
@@ -47,6 +82,19 @@ private:
 	bool ProcessConnection(FSocket* ClientSocket);
 	void ClearActiveSocket();
 	TSharedPtr<FDaMCPExecResult> ExecuteOnGameThread(const FString& Code);
+	/** Executes Python on the game thread inside one FScopedTransaction. MUST be
+	 *  called on the game thread (AsyncTask'd or from the ticker). */
+	FDaMCPExecResult ExecuteInTransaction(const FString& Code);
+
+	// --- async jobs ---
+	int32 SubmitAsyncJob(const FString& SetupCode, const FString& StepCode, FString& OutError);
+	bool PollJob(int32 JobId, FString& OutStatus, int32& OutSlicesDone, FString& OutError, FString& OutOutput);
+	void RequestCancel(int32 JobId);
+	bool OnGameThreadTick(float DeltaTime);
+	void RegisterTicker();
+	void UnregisterTicker();
+	void CleanupFinishedJobs();
+	static void ParseState(const FString& Log, FDaMCPJob& Job);
 
 	FSocket* ListenerSocket = nullptr;
 	FSocket* ActiveClientSocket = nullptr;
@@ -55,4 +103,10 @@ private:
 	FThreadSafeBool bRunning;
 	FThreadSafeBool bStopping;
 	int32 Port = 8765;
+
+	// --- async state ---
+	FCriticalSection JobLock;
+	TMap<int32, TSharedPtr<FDaMCPJob>> Jobs;
+	int32 NextJobId = 1;
+	FTSTicker::FDelegateHandle TickerHandle;
 };
