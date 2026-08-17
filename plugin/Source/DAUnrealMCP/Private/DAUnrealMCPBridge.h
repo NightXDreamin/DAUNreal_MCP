@@ -58,11 +58,14 @@ struct FDaMCPJob
  * being short-lived.
  *
  * Request protocol (newline-delimited JSON):
- *   sync   : {"id":N, "code":"..."}                          (backwards-compatible)
+ *   sync   : {"id":N, "code":"...", "token":"..."}       (backwards-compatible)
  *   async  : {"id":N, "action":"execute", "mode":"async",
- *             "setup_code":"...", "step_code":"..."}
- *   poll   : {"id":N, "action":"poll", "job_id":M}
- *   cancel : {"id":N, "action":"cancel", "job_id":M}
+ *             "setup_code":"...", "step_code":"...", "code":"...", "token":"..."}
+ *   poll   : {"id":N, "action":"poll", "job_id":M, "token":"..."}
+ *   cancel : {"id":N, "action":"cancel", "job_id":M, "token":"..."}
+ *
+ * ``token`` is optional when auth is disabled (token file write failed). The
+ * bridge writes its auth token to <Saved>/DAUnrealMCP/endpoint.json on start.
  */
 class FDAUnrealMCPBridge : public FRunnable
 {
@@ -96,6 +99,10 @@ private:
 	void CleanupFinishedJobs();
 	static void ParseState(const FString& Log, FDaMCPJob& Job);
 
+	// --- security / audit ---
+	bool IsAuthorized(const TSharedPtr<FJsonObject>& ReqObj) const;
+	void LogHistory(const FString& Mode, const FString& Code, bool bOk, const FString& Error);
+
 	FSocket* ListenerSocket = nullptr;
 	FSocket* ActiveClientSocket = nullptr;
 	FCriticalSection SocketLock;
@@ -103,6 +110,7 @@ private:
 	FThreadSafeBool bRunning;
 	FThreadSafeBool bStopping;
 	int32 Port = 8765;
+	FString AuthToken;  // empty => auth disabled (token file write failed)
 
 	// --- async state ---
 	FCriticalSection JobLock;

@@ -10,6 +10,7 @@ business toolset) around a script pass-through:
 Run with:  python server.py
 """
 
+import ast
 import asyncio
 import json
 import os
@@ -20,6 +21,7 @@ import threading
 import anyio
 from mcp.server import MCPServer
 from mcp.server.mcpserver.context import Context
+from mcp.server.mcpserver.utilities.types import Image
 
 import da_async
 
@@ -38,7 +40,20 @@ ASYNC_TIMEOUT = 600.0   # async: hard cap before we cancel the job
 # requests because the plugin executes with EPythonFileExecutionScope::Public.
 DA_PRELUDE = '''\
 # === auto-injected da helpers (DAUnreal MCP) ===
-if "da" not in globals():
+# Re-inject when `da` is missing OR present but broken. A plain
+# `if "da" not in globals()` guard cannot self-heal: if `da` survives while one
+# of its dependencies is gone, every da.* call fails forever and the only way
+# out is restarting the editor. So probe the real functionality, and probe every
+# helper that has module-level dependencies (dumps, reset).
+try:
+    _da_ok = (
+        callable(getattr(da, "dumps", None))
+        and da.dumps({"_": 1}) is not None
+        and isinstance(getattr(type(da), "_protected", None), set)
+    )
+except Exception:
+    _da_ok = False
+if not _da_ok:
     import json as _da_json
     import unreal  # ensure unreal is loaded and protected before snapshotting
     _da_protected = set(globals())
@@ -87,7 +102,8 @@ if "da" not in globals():
 
         @staticmethod
         def dumps(obj, depth=3):
-            return _da_json.dumps(_Da._dump(obj, depth), ensure_ascii=False, default=str)
+            import json as _j  # local import: no dependency on a module-level name
+            return _j.dumps(_Da._dump(obj, depth), ensure_ascii=False, default=str)
 
         @staticmethod
         def u(path):
@@ -111,13 +127,18 @@ if "da" not in globals():
 
         @staticmethod
         def reset():
+            # The protected set is stashed on the class, not in globals(): a
+            # module-level name can be deleted (by a previous reset, a stray
+            # script, or a cleanup routine) and then reset() would break forever.
+            protected = getattr(_Da, "_protected", None) or set()
             for _k in list(globals()):
-                if _k.startswith("__") or _k in _da_protected:
+                if _k.startswith("__") or _k in protected:
                     continue
                 del globals()[_k]
 
     da = _Da()
     _da_protected.update(("_Da", "da", "_da_json", "_da_protected", "unreal"))
+    _Da._protected = set(_da_protected)
 # === end da helpers ===
 '''
 
@@ -137,6 +158,11 @@ class UEBridge:
         self.port = port
         self._lock = threading.Lock()
         self._counter = 0
+        # Auth token is read from the plugin's endpoint.json (path via the
+        # DAUNREAL_MCP_ENDPOINT env var); empty when unset => no token sent.
+        self.endpoint_path = os.environ.get("DAUNREAL_MCP_ENDPOINT", "")
+        self._token = ""
+        self._token_mtime: float | None = None
 
     def _next_id(self) -> int:
         self._counter += 1
@@ -160,11 +186,37 @@ class UEBridge:
                 data += chunk
         return data.decode("utf-8")
 
+    def _load_token(self) -> str:
+        """Read the auth token from the plugin's endpoint.json, re-reading only
+        when the file changed (the editor regenerates it on each start).
+
+        Any failure degrades to "no token" rather than raising: the file can be
+        missing, half-written (the editor writes it during startup), or contain
+        unexpected JSON. A parse error here must not break every request.
+        """
+        if not self.endpoint_path:
+            return ""
+        try:
+            mtime = os.path.getmtime(self.endpoint_path)
+            if mtime == self._token_mtime:
+                return self._token
+            with open(self.endpoint_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            self._token = data.get("token", "") if isinstance(data, dict) else ""
+            self._token_mtime = mtime
+        except (OSError, ValueError, UnicodeDecodeError):
+            # ValueError covers json.JSONDecodeError (truncated/invalid file).
+            self._token = ""
+        return self._token
+
     def _request(self, payload: dict) -> dict:
         with self._lock:
             request_id = self._next_id()
             payload = dict(payload)
             payload["id"] = request_id
+            token = self._load_token()
+            if token:
+                payload["token"] = token
             sock: socket.socket | None = None
             try:
                 sock = self._connect()
@@ -205,12 +257,13 @@ class UEBridge:
     def execute(self, code: str) -> dict:
         return self._request({"code": code})
 
-    def submit_async(self, setup_code: str, step_code: str) -> dict:
+    def submit_async(self, setup_code: str, step_code: str, code: str = "") -> dict:
         return self._request({
             "action": "execute",
             "mode": "async",
             "setup_code": setup_code,
             "step_code": step_code,
+            "code": code,
         })
 
     def poll(self, job_id: int) -> dict:
@@ -268,7 +321,7 @@ async def _run_async(code: str, ctx: Context) -> str:
     if not prelude_resp.get("ok"):
         return f"ERROR: {prelude_resp.get('error', 'failed to inject da helpers')}"
 
-    resp = bridge.submit_async(transformed.setup_code, transformed.step_code)
+    resp = bridge.submit_async(transformed.setup_code, transformed.step_code, code)
     if not resp.get("ok"):
         return f"ERROR: {resp.get('error', 'async submit failed')}"
 
@@ -333,8 +386,125 @@ def _map_traceback(error: str, line_map: dict) -> str:
     return re.sub(r'File "<string>", line (\d+)', _replace, error)
 
 
+# Operations that mutate the scene or assets — flagged as dangerous in dry-run.
+# Name-based matching: we only see the attribute/function name, not the object it
+# is called on, so this is a *heuristic preview*, not a sandbox (see the caveat
+# printed in every report).
+DRY_RUN_DANGEROUS = frozenset({
+    # asset lifecycle
+    "delete_asset", "delete_loaded_asset", "delete_loaded_assets", "delete_directory",
+    "rename_asset", "rename_directory", "duplicate_asset", "duplicate_directory",
+    "save_asset", "save_loaded_asset", "save_loaded_assets", "save_package",
+    "save_directory", "make_directory", "create_asset", "create_unique_asset_name",
+    "checkout_asset", "checkout_loaded_asset", "consolidate_assets",
+    "import_asset_tasks", "export_assets", "set_metadata_tag", "remove_metadata_tag",
+    # actor lifecycle
+    "destroy_actor", "destroy_actors", "delete_actor", "destroy_component",
+    "spawn_actor_from_class", "spawn_actor_from_object", "duplicate_actor",
+    "duplicate_actors", "convert_actors", "attach_to_actor", "detach_from_actor",
+    "add_component", "add_component_by_class", "destroy_actor_component",
+    # transforms / properties (silently move things — easy to miss visually)
+    "set_actor_location", "set_actor_rotation", "set_actor_scale3d",
+    "set_actor_transform", "set_actor_location_and_rotation",
+    "set_actor_label", "set_editor_property", "set_editor_properties",
+    "set_world_location", "set_relative_location", "set_relative_transform",
+    "modify",
+    # level lifecycle — new_level/load_level discard unsaved work
+    "new_level", "new_level_from_template", "load_level",
+    "save_current_level", "save_all_dirty_levels",
+    # build / PIE — long, state-changing
+    "build", "build_light_maps", "build_lighting",
+    "editor_request_begin_play", "editor_request_end_play", "editor_play_simulate",
+    # undo stack
+    "transact_undo", "transact_redo", "undo", "redo",
+})
+
+# Escape hatches: dynamic dispatch or non-`unreal` destruction that name-based
+# analysis cannot see through. Reported separately so the caveat is explicit.
+DRY_RUN_OPAQUE = frozenset({
+    "eval", "exec", "compile", "__import__", "getattr", "setattr", "delattr",
+    "globals", "locals", "vars",
+})
+DRY_RUN_EXTERNAL = frozenset({
+    "remove", "unlink", "rmtree", "rmdir", "move", "copytree", "chmod",
+    "run", "call", "check_call", "check_output", "Popen", "system", "popen",
+    "write", "writelines", "truncate",
+})
+
+
+def _dry_run_report(code: str) -> str:
+    """Statically analyse a script and report what it would call — WITHOUT
+    executing it. Highlights dangerous (mutating) calls so the AI can preview
+    side effects before delete/destroy/save/spawn.
+
+    This is a *heuristic preview*, not a sandbox: matching is by call name, so
+    dynamic dispatch (``getattr``/``eval``) and destruction outside the
+    ``unreal`` API (``os.remove``, ``subprocess``) cannot be detected reliably.
+    Those are surfaced under their own headings instead of being silently
+    ignored.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        return f"ERROR: SyntaxError at line {exc.lineno}: {exc.msg}"
+
+    calls: set[str] = set()
+    imports: list[str] = []
+    loops = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute):
+                calls.add(node.func.attr)
+            elif isinstance(node.func, ast.Name):
+                calls.add(node.func.id)
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            loops += 1
+        elif isinstance(node, ast.Import):
+            imports.extend(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imports.append("." * node.level + (node.module or ""))
+
+    dangerous = sorted(calls & DRY_RUN_DANGEROUS)
+    opaque = sorted(calls & DRY_RUN_OPAQUE)
+    external = sorted(calls & DRY_RUN_EXTERNAL)
+
+    if dangerous or external:
+        risk = "HIGH"
+    elif opaque:
+        risk = "UNKNOWN"       # cannot be judged statically
+    elif calls:
+        risk = "MEDIUM"
+    else:
+        risk = "LOW"
+
+    lines = ["DRY RUN — script was NOT executed", ""]
+    if dangerous:
+        lines.append("dangerous calls (mutate scene/assets):")
+        lines.extend(f"  - {c}" for c in dangerous)
+    else:
+        lines.append("dangerous calls: (none)")
+    if external:
+        lines.append("")
+        lines.append("outside-editor side effects (filesystem/process):")
+        lines.extend(f"  - {c}" for c in external)
+    if opaque:
+        lines.append("")
+        lines.append("dynamic dispatch — static analysis cannot see the real target:")
+        lines.extend(f"  - {c}" for c in opaque)
+    lines.append("")
+    lines.append(f"all called functions: {', '.join(sorted(calls)) if calls else '(none)'}")
+    lines.append(f"loops: {loops}")
+    lines.append(f"imports: {', '.join(imports) if imports else '(none)'}")
+    lines.append(f"risk: {risk}")
+    lines.append("")
+    lines.append("note: name-based heuristic, not a sandbox — it cannot resolve "
+                 "dynamic dispatch or judge intent. Review the script itself for "
+                 "anything destructive.")
+    return "\n".join(lines)
+
+
 @server.tool()
-async def execute_python(code: str, ctx: Context, mode: str = "sync") -> str:
+async def execute_python(code: str, ctx: Context, mode: str = "sync", dry_run: bool = False) -> str:
     """Execute a Python script inside the running Unreal Editor.
 
     The script runs with full access to the ``unreal`` module and its namespace
@@ -354,6 +524,15 @@ async def execute_python(code: str, ctx: Context, mode: str = "sync") -> str:
     blocking call, or only comprehensions — it falls back to sync execution and
     will block the editor until it finishes.
 
+    ``dry_run``: when True, analyse the script statically and report what it
+    would call (dangerous operations highlighted) WITHOUT executing it — use
+    before delete/destroy/save/spawn to preview side effects. It is a
+    name-matching heuristic, **not** a sandbox: it cannot resolve dynamic
+    dispatch (``getattr``/``eval``) or judge intent, and destruction outside the
+    ``unreal`` API (``os.remove``, ``subprocess``) is reported separately rather
+    than inferred. A clean dry-run report is not a guarantee — still read the
+    script.
+
     Prefer non-deprecated editor APIs, e.g.:
         subsys = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
         actors = subsys.get_all_level_actors()
@@ -362,6 +541,8 @@ async def execute_python(code: str, ctx: Context, mode: str = "sync") -> str:
     """
     if not code or not code.strip():
         return "Error: code is empty."
+    if dry_run:
+        return _dry_run_report(code)
     if mode != "async":
         return _format(_run(code))
     return await _run_async(code, ctx)
@@ -447,6 +628,44 @@ def reset_session() -> str:
     gets cluttered or a variable is interfering.
     """
     return _format(_run("da.reset(); print('session namespace reset')"))
+
+
+@server.tool()
+def screenshot(width: int = 1280, height: int = 720) -> Image:
+    """Capture the editor viewport and return it as an image.
+
+    Triggers a high-res screenshot, waits for it to land in the editor's
+    screenshot directory, and returns the PNG as an image (visible to the AI).
+    Use it to "see" the current viewport after a script changes the scene.
+    """
+    import time as _time
+
+    fn = f"daunreal_{int(_time.time() * 1000)}.png"
+    shot_code = (
+        "import unreal\n"
+        f"unreal.AutomationLibrary.take_high_res_screenshot({int(width)}, {int(height)}, {fn!r})\n"
+        "print('SHOT_DIR', unreal.Paths.screen_shot_dir())\n"
+    )
+    resp = _run(shot_code)
+    if not resp.get("ok"):
+        return f"ERROR: {resp.get('error', 'screenshot trigger failed')}"
+
+    shot_dir = None
+    for ln in (resp.get("log") or "").splitlines():
+        if ln.startswith("SHOT_DIR "):
+            shot_dir = ln[len("SHOT_DIR "):].strip()
+            break
+    if not shot_dir:
+        return "ERROR: could not determine screenshot directory"
+
+    full = os.path.join(shot_dir, fn)
+    deadline = _time.time() + 10.0
+    while _time.time() < deadline:
+        if os.path.exists(full) and os.path.getsize(full) > 0:
+            return Image(path=full)
+        _time.sleep(0.2)
+
+    return "ERROR: screenshot file not found after 10s"
 
 
 # --------------------------------------------------------------------------- #

@@ -29,10 +29,38 @@ def check(name, cond, detail=""):
     print(f"[{'PASS' if cond else 'FAIL'}] {name}" + (f"  -- {detail}" if detail else ""))
 
 
+def _auth_token():
+    """Read the bridge auth token the same way server.py does.
+
+    Phase 6 added token auth, so bare bridge calls must carry it. Returns ""
+    when auth is disabled.
+    """
+    candidates = [os.environ.get("DAUNREAL_MCP_ENDPOINT", "")]
+    for proj in (r"C:\Users\qingpulou\Documents\Unreal Projects\DAUNrealTest55",
+                 r"C:\Users\qingpulou\Documents\Unreal Projects\DAUNrealTest"):
+        candidates.append(os.path.join(proj, "Saved", "DAUnrealMCP", "endpoint.json"))
+    for path in candidates:
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if int(data.get("port", -1)) == PORT and data.get("token"):
+                return data["token"]
+        except (OSError, ValueError):
+            continue
+    return ""
+
+
+AUTH_TOKEN = _auth_token()
+
+
 def raw(payload, tmo=120):
     s = socket.create_connection(("127.0.0.1", PORT), timeout=tmo)
     s.settimeout(tmo)
     try:
+        if AUTH_TOKEN and "token" not in payload:
+            payload = {**payload, "token": AUTH_TOKEN}
         s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
         d = b""
         while True:
@@ -130,6 +158,13 @@ check("da is absent before the async run", "False" in log_of(r), log_of(r).strip
 
 env = dict(os.environ)
 env["DAUNREAL_MCP_PORT"] = str(PORT)
+if AUTH_TOKEN and not env.get("DAUNREAL_MCP_ENDPOINT"):
+    for _proj in (r"C:\Users\qingpulou\Documents\Unreal Projects\DAUNrealTest55",
+                  r"C:\Users\qingpulou\Documents\Unreal Projects\DAUNrealTest"):
+        _ep = os.path.join(_proj, "Saved", "DAUnrealMCP", "endpoint.json")
+        if os.path.exists(_ep):
+            env["DAUNREAL_MCP_ENDPOINT"] = _ep
+            break
 proc = subprocess.Popen(
     [VENV_PY, "server.py"], cwd=SERVER_DIR,
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

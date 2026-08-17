@@ -8,8 +8,13 @@
 #include "Dom/JsonObject.h"
 #include "HAL/PlatformMemory.h"
 #include "HAL/PlatformProcess.h"
+#include "HAL/FileManager.h"
 #include "Interfaces/IPv4/IPv4Address.h"
 #include "Interfaces/IPv4/IPv4Endpoint.h"
+#include "Misc/DateTime.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Guid.h"
+#include "Misc/Paths.h"
 #include "PythonScriptPlugin/Public/IPythonScriptPlugin.h"
 #include "ScopedTransaction.h"
 #include "Serialization/JsonReader.h"
@@ -126,6 +131,34 @@ bool FDAUnrealMCPBridge::Start(int32 InPort)
 	Port = InPort;
 	bStopping = false;
 	bRunning = false;
+
+	// Generate the auth token and publish it for the server to read. If the
+	// write fails, auth is disabled (empty token) so the bridge stays usable.
+	AuthToken = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens);
+	{
+		const FString EndpointDir = FPaths::ProjectSavedDir() / TEXT("DAUnrealMCP");
+		IFileManager::Get().MakeDirectory(*EndpointDir, true);
+		const FString EndpointPath = EndpointDir / TEXT("endpoint.json");
+
+		TSharedRef<FJsonObject> EndpointObj = MakeShareable(new FJsonObject());
+		EndpointObj->SetStringField(TEXT("token"), AuthToken);
+		EndpointObj->SetNumberField(TEXT("port"), Port);
+		FString EndpointStr;
+		TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> EndpointWriter =
+			TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&EndpointStr);
+		FJsonSerializer::Serialize(EndpointObj, EndpointWriter);
+
+		if (!FFileHelper::SaveStringToFile(EndpointStr + LINE_TERMINATOR, *EndpointPath,
+			FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[DAUnrealMCP] Failed to write endpoint.json; auth disabled"));
+			AuthToken.Reset();
+		}
+		else
+		{
+			UE_LOG(LogTemp, Log, TEXT("[DAUnrealMCP] Auth token written to %s"), *EndpointPath);
+		}
+	}
 
 	ISocketSubsystem* SocketSubsystem = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
 	if (!SocketSubsystem)
@@ -279,6 +312,13 @@ bool FDAUnrealMCPBridge::ProcessConnection(FSocket* ClientSocket)
 	const int32 Id = ReqObj->GetIntegerField(TEXT("id"));
 	const FString Action = ReqObj->HasField(TEXT("action")) ? ReqObj->GetStringField(TEXT("action")) : TEXT("execute");
 
+	if (!IsAuthorized(ReqObj))
+	{
+		SendErrorResponse(ClientSocket, Id, TEXT("unauthorized: invalid token"));
+		ClearActiveSocket();
+		return true;
+	}
+
 	if (Action == TEXT("poll"))
 	{
 		const int32 JobId = ReqObj->GetIntegerField(TEXT("job_id"));
@@ -334,6 +374,7 @@ bool FDAUnrealMCPBridge::ProcessConnection(FSocket* ClientSocket)
 	{
 		const FString SetupCode = ReqObj->GetStringField(TEXT("setup_code"));
 		const FString StepCode = ReqObj->GetStringField(TEXT("step_code"));
+		const FString OrigCode = ReqObj->HasField(TEXT("code")) ? ReqObj->GetStringField(TEXT("code")) : FString();
 
 		// Single concurrent job: reject while another job is still running.
 		{
@@ -353,10 +394,12 @@ bool FDAUnrealMCPBridge::ProcessConnection(FSocket* ClientSocket)
 		const int32 JobId = SubmitAsyncJob(SetupCode, StepCode, SetupError);
 		if (JobId < 0)
 		{
+			LogHistory(TEXT("async"), OrigCode, false, SetupError);
 			SendErrorResponse(ClientSocket, Id, SetupError.IsEmpty() ? TEXT("async submit failed") : SetupError);
 			ClearActiveSocket();
 			return true;
 		}
+		LogHistory(TEXT("async"), OrigCode, true, FString());
 
 		TSharedRef<FJsonObject> Resp = MakeShareable(new FJsonObject());
 		Resp->SetNumberField(TEXT("id"), Id);
@@ -403,6 +446,9 @@ bool FDAUnrealMCPBridge::ProcessConnection(FSocket* ClientSocket)
 		}
 		Resp->SetStringField(TEXT("error"), Err);
 	}
+
+	const FString SyncErr = R->bOk ? FString() : (R->Error.IsEmpty() ? R->Result : R->Error);
+	LogHistory(TEXT("sync"), Code, R->bOk, SyncErr);
 
 	const bool bSent = SendLine(ClientSocket, SerializeCondensed(Resp));
 	ClearActiveSocket();
@@ -692,4 +738,60 @@ void FDAUnrealMCPBridge::CleanupFinishedJobs()
 	{
 		Jobs.Remove(Key);
 	}
+}
+
+bool FDAUnrealMCPBridge::IsAuthorized(const TSharedPtr<FJsonObject>& ReqObj) const
+{
+	if (AuthToken.IsEmpty())
+	{
+		return true;  // auth disabled (token file write failed) — stay usable
+	}
+	FString Token;
+	if (!ReqObj->TryGetStringField(TEXT("token"), Token))
+	{
+		return false;
+	}
+	// Case-SENSITIVE compare: FString::operator== is case-INsensitive, which
+	// would make the hex digits of the GUID interchangeable (A == a) and shrink
+	// the guessing space for no reason.
+	return Token.Equals(AuthToken, ESearchCase::CaseSensitive);
+}
+
+void FDAUnrealMCPBridge::LogHistory(const FString& Mode, const FString& Code, bool bOk, const FString& Error)
+{
+	// Cap what we persist: history.jsonl is append-only, so an unbounded script
+	// body (batch scripts can be tens of KB) would grow the file without limit.
+	// Keep enough of the head to identify the script.
+	constexpr int32 MaxLoggedChars = 4000;
+	auto Clip = [](const FString& In) -> FString
+	{
+		if (In.Len() <= MaxLoggedChars)
+		{
+			return In;
+		}
+		return In.Left(MaxLoggedChars) +
+			FString::Printf(TEXT("... [truncated, %d chars total]"), In.Len());
+	};
+
+	const FString HistoryDir = FPaths::ProjectSavedDir() / TEXT("DAUnrealMCP");
+	const FString HistoryPath = HistoryDir / TEXT("history.jsonl");
+
+	TSharedRef<FJsonObject> Entry = MakeShareable(new FJsonObject());
+	Entry->SetStringField(TEXT("ts"), FDateTime::Now().ToIso8601());
+	Entry->SetStringField(TEXT("mode"), Mode);
+	Entry->SetStringField(TEXT("code"), Clip(Code));
+	Entry->SetBoolField(TEXT("ok"), bOk);
+	if (!Error.IsEmpty())
+	{
+		Entry->SetStringField(TEXT("error"), Clip(Error));
+	}
+
+	FString EntryStr;
+	TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+		TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&EntryStr);
+	FJsonSerializer::Serialize(Entry, Writer);
+
+	IFileManager::Get().MakeDirectory(*HistoryDir, true);
+	FFileHelper::SaveStringToFile(EntryStr + LINE_TERMINATOR, *HistoryPath,
+		FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM, &IFileManager::Get(), FILEWRITE_Append);
 }
