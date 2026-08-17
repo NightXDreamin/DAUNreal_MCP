@@ -8,6 +8,7 @@
 
 - **脚本直通 (Script Pass-through)**：核心工具 `execute_python` 在 UE 编辑器 Python VM 直接执行任意 Python 脚本，让 AI 自由调用完整的 `unreal.*` API，而非受限的预定义工具集。
 - **游戏线程执行 + 命名空间持久化**：插件以 `EPythonFileExecutionScope::Public` 在游戏线程同步执行，变量与 import 跨调用持久化（REPL 风格），会话状态可复用。
+- **Undo 事务包裹**：每次脚本执行用 `FScopedTransaction` 包裹，AI 改场景/资产后可在编辑器内 Ctrl+Z 回滚（对齐 DAMaya_MCP 的 undo chunk）。
 - **内置 `da` 序列化 helper**：自动注入编辑器命名空间，`da.dump` / `da.dumps` 将 UObject / struct / 数组转成可读 dict / JSON。
 - **API 内省工具**：`python_help` 通过 `dir` + docstring 帮助 AI 在写脚本前发现 `unreal` API，降低试错成本。
 - **本地回环 TCP 桥**：C++ 插件在 `127.0.0.1:8765` 提供 NDJSON-over-TCP 桥，仅监听回环地址，无外网暴露。

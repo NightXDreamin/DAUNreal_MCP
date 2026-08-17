@@ -14,6 +14,7 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+#include "ScopedTransaction.h"
 #include "SocketSubsystem.h"
 #include "Sockets.h"
 
@@ -317,39 +318,47 @@ TSharedPtr<FDaMCPExecResult> FDAUnrealMCPBridge::ExecuteOnGameThread(const FStri
 	{
 		TSharedPtr<FDaMCPExecResult> R = MakeShareable(new FDaMCPExecResult());
 
-		IPythonScriptPlugin* Py = IPythonScriptPlugin::Get();
-		if (!Py || !Py->IsPythonAvailable())
 		{
-			R->bOk = false;
-			R->Error = TEXT("PythonScriptPlugin is not available. Enable the 'Python Editor Script Plugin' and restart the editor.");
-		}
-		else
-		{
-			FPythonCommandEx Cmd;
-			Cmd.Command = Code;
-			Cmd.ExecutionMode = EPythonCommandExecutionMode::ExecuteFile;
-			Cmd.FileExecutionScope = EPythonFileExecutionScope::Public;
-			Cmd.Flags = EPythonCommandFlags::None;
+			// Wrap execution in an undo transaction so AI-driven edits can be rolled
+			// back with Ctrl+Z (mirrors DAMaya_MCP's undo chunk). Pure-query scripts
+			// produce an empty transaction that UTransBuffer discards, so this is
+			// harmless for reads.
+			FScopedTransaction Transaction(FText::FromString(TEXT("DAUnreal MCP Execute Python")));
 
-			const bool bSuccess = Py->ExecPythonCommandEx(Cmd);
-
-			R->bOk = bSuccess;
-			R->Result = Cmd.CommandResult;
-
-			FString LogStr;
-			for (const FPythonLogOutputEntry& Entry : Cmd.LogOutput)
+			IPythonScriptPlugin* Py = IPythonScriptPlugin::Get();
+			if (!Py || !Py->IsPythonAvailable())
 			{
-				if (Entry.Output.IsEmpty())
-				{
-					continue;
-				}
-				if (!LogStr.IsEmpty())
-				{
-					LogStr += TEXT("\n");
-				}
-				LogStr += Entry.Output;
+				R->bOk = false;
+				R->Error = TEXT("PythonScriptPlugin is not available. Enable the 'Python Editor Script Plugin' and restart the editor.");
 			}
-			R->Log = LogStr;
+			else
+			{
+				FPythonCommandEx Cmd;
+				Cmd.Command = Code;
+				Cmd.ExecutionMode = EPythonCommandExecutionMode::ExecuteFile;
+				Cmd.FileExecutionScope = EPythonFileExecutionScope::Public;
+				Cmd.Flags = EPythonCommandFlags::None;
+
+				const bool bSuccess = Py->ExecPythonCommandEx(Cmd);
+
+				R->bOk = bSuccess;
+				R->Result = Cmd.CommandResult;
+
+				FString LogStr;
+				for (const FPythonLogOutputEntry& Entry : Cmd.LogOutput)
+				{
+					if (Entry.Output.IsEmpty())
+					{
+						continue;
+					}
+					if (!LogStr.IsEmpty())
+					{
+						LogStr += TEXT("\n");
+					}
+					LogStr += Entry.Output;
+				}
+				R->Log = LogStr;
+			}
 		}
 
 		Promise->SetValue(R);

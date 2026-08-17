@@ -21,7 +21,8 @@ public class DAUnrealMCP : ModuleRules
 			"Sockets",
 			"Json",
 			"JsonUtilities",
-			"PythonScriptPlugin"
+			"PythonScriptPlugin",
+			"UnrealEd"
 		});
 	}
 }
