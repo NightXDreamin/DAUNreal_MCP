@@ -138,3 +138,281 @@ powershell -ExecutionPolicy Bypass -File C:\Users\qingpulou\Documents\GitHub\DAU
 
 - 流式输出 / 长任务异步
 - PIE / 运行时支持（加 Runtime 模块）
+
+## 13. 第三阶段结论：Undo 事务包裹（已完成 ✅）
+
+- **改动**：`DAUnrealMCPBridge.cpp` 的 `ExecuteOnGameThread` 内用 `FScopedTransaction`（作用域块）包住 `ExecPythonCommandEx`；`DAUnrealMCP.Build.cs` 的 `PrivateDependencyModuleNames` 加 `UnrealEd`。
+- **验证（UE 5.5.4 实机）**：`spawn_actor_from_class` / `set_actor_location` 执行后 `GEditor->Trans->CanUndo()==true`（日志 `DIAG CanUndo=1`），改动已进 undo buffer，用户在编辑器内 Ctrl+Z 可回滚。
+- **关键坑（务必记住）**：`TRANSACTION UNDO` 不能通过 `execute_python` 触发——脚本本身也被包在事务里，`UTransBuffer::CanUndo()` 在 `ActiveCount>0` 时直接返回 false（"Can't undo while action is in progress"）。撤销必须由用户在编辑器内 Ctrl+Z（事务外）触发，这是设计意图，不是 bug。
+- **注意**：`EditorActorSubsystem::SpawnActor` 内部不开事务也不调 `Modify`（走 `TryPlacingActorFromObject`），但新 actor 是 `RF_Transactional`，配合外层 `FScopedTransaction` 仍能进 undo buffer（已实测 `CanUndo=1`）。
+
+## 14. 第四阶段结论：异步 + 进度 + 取消（已完成 ✅）
+
+- **AST 变换层**（`server/da_async.py`）：给循环体末尾注入 `yield`、把脚本包成 generator 函数并注入 `global`（保 REPL 持久化），产出 `setup_code` / `step_code` / `line_map` / `steppable`。纯 CPython 12 用例 + UE 真机 12 用例语义等价验证全过。
+- **插件侧**（`DAUnrealMCPBridge`）：协议扩展 `action=execute(mode=sync|async)/poll/cancel`；job 表 + FTSTicker 按 4ms 时间预算逐帧推进；取消 = `g.close()` → GeneratorExit → `finally` → 每分片 `FScopedTransaction` 正确 End；单 job 并发限制；poll 返回 `status/slices_done/output/error`。
+- **server 侧**：`execute_python(code, ctx, mode="sync|async")`；async 走 submit→轮询（0.5s）→`ctx.report_progress(slices)`；`mode` 默认 sync 完全兼容。
+- **实机验证（UE 5.5.4）**：500 万次迭代 job 执行期间 9 次 sync ping 延迟仅 24-36ms（编辑器不冻结）；stdio 端到端 async 成功 + progress 通知 + 结果正确；客户端取消后 job 槽位释放、新 job 可跑。
+
+### 关键坑（务必记住）
+
+1. **`time.monotonic()`/`monotonic_ns()` 在部分 Windows Python 是毫秒粒度**（GetTickCount64 支撑，相邻调用差值 0），会让亚毫秒预算永不触发 → 预算检查必须用 `time.perf_counter_ns()`（QPC，100ns）。
+2. **`AddTicker(TCHAR*, float, TFunction)` 重载 5.4/5.5 签名不一致**（`TFunction`→`TUniqueFunction&&`）→ 必须用 `AddTicker(const FTickerDelegate&, float)`，且返回值类型是 `FTSTicker::FDelegateHandle`（非通用 `FDelegateHandle`）。
+3. **工具注入的 `Context`（`mcp.server.mcpserver.context`）没有 `cancel_requested`**；mcp 2.0 默认 `peer_cancel_mode="interrupt"`，客户端 `notifications/cancelled` 会让 handler 的 await 抛 `CancelledError` → 捕获后在 `anyio.CancelScope(shield=True)` 里发 cancel 并等确认。
+4. **progress 通知需要请求带 `_meta.progressToken`**（不带 token 时 `report_progress` 不产生通知）。
+5. **无循环脚本 `steppable=False`**（`_da_gen` 不是 generator，`next()` 会崩）→ server 回退 sync 执行。
+6. **AST 变换后 traceback 行号偏移** → `line_map` 做顶层语句粒度映射（`File "<string>", line N` 正则替换还原）。
+7. server 多端口：`DAUNREAL_MCP_PORT` 环境变量（5.4 工程 8765 / 5.5 工程 8766 各跑一个实例）。
+
+## 15. 第五阶段结论：知识层（已完成 ✅）
+
+- **resource**（`@server.resource`）：`daunreal://subsystems`（8 个常用 Editor Subsystem 对照表）、`daunreal://deprecated-api`（Editor*Library → Editor*Subsystem 映射）、`daunreal://conventions`（工程约定）。内容经实测 `dir(unreal)`/`dir(subsystem)` 背书，不编造 API。
+- **`python_search(keyword)`**（`@server.tool`）：`dir(unreal)` 大小写不敏感子串匹配，分类（class/函数）+ 排序 + 每类截断 40。只搜顶层名——方法名（如 `spawn_actor_from_class`）需先搜类名再 `python_help`。
+- **prompt**（`@server.prompt`）：`batch-process-assets`（async 顶层循环 + `AssetRegistryHelpers.get_asset_registry().get_all_assets()` + `unreal.load_asset(package_name.asset_name)`）、`scene-inspection`（`EditorActorSubsystem.get_all_level_actors()` + `da.dumps`）。
+- **独立 QA 修复收口**（另一个 AI）：`_collect_stmt` 补 `ast.While` 分支（否则 while 体内赋值丢 global）；async 路径补 `DA_PRELUDE` 注入（独立请求发送，不能拼进 setup_code）；`ast.Lambda` 死代码清理 + walrus 统一 `_collect_walrus`；`execute_python` docstring 写明三个 `steppable=False` 限制。新增 `test_da_async_edgecases.py`（41 项）+ `test_async_realeditor.py`（18 项真机）可进 CI。
+- **验证**：三套测试 12+41+18 全绿；resource/python_search/prompt 均经 stdio 真机验证。
+
+### 关键坑（知识层新增）
+1. `AssetData` 没有 `object_path` 属性（实测报错）；取路径用 `str(a.package_name) + "." + str(a.asset_name)`，加载用 `unreal.load_asset(path)`。
+2. `python_search` 只搜 `unreal` 模块**顶层**名字，方法名搜不到（那是 `python_help` 对具体类 `dir` 的职责）。
+3. `@server.prompt` 返回 `str` 时 SDK 包装成 `{"role":"user","content":{"text":...}}`，客户端取内容要兼容 dict。
+
+## 16. 第六阶段结论：dry_run + token 鉴权 + 审计日志（已完成 ✅）
+- **dry_run**（server 纯 Python）：`execute_python(dry_run=True)` 用 AST 静态分析（`DRY_RUN_DANGEROUS` 集合：delete_asset/destroy_actor/set_editor_property/spawn/save/rename/duplicate/modify 等），报告危险调用 + 循环/import 结构 + 风险分级（HIGH/MEDIUM/LOW），不连 bridge、不执行。真机验证 actor 138→138。
+- **token 鉴权**（插件 C++ + server）：插件启动生成 `FGuid` token 写 `<Saved>/DAUnrealMCP/endpoint.json`（含 token+port），每请求验证 `token` 字段（不匹配返回 unauthorized；写失败时 `AuthToken` 置空禁用鉴权）。server 读 `DAUNREAL_MCP_ENDPOINT` 环境变量指向的 endpoint.json（按 mtime 缓存，编辑器重启换 token 自动刷新），每请求带 token。
+- **审计日志**（插件 C++）：`LogHistory()` 每次执行写 `<Saved>/DAUnrealMCP/history.jsonl`（追加，ts/mode/code/ok/error）；sync 记录原始 code，async 记录 server 传的原始 `code` 字段。
+- **验证**：无/错 token → unauthorized、正确 token → 执行成功；history.jsonl 落盘 2 条（sync+async 含原始 code）；sync/async 回归全过。
+
+### 关键坑（第六阶段新增）
+1. **`FFileHelper::SaveStringToFile` 的 FileManager 参数不能传 `nullptr`**：UE5.5 签名 `(FStringView, const TCHAR*, EEncodingOptions, IFileManager* = &IFileManager::Get(), uint32 WriteFlags)`，实现第一行直接 `FileManager->CreateFileWriter(...)` 无空检查，传 `nullptr` → EXCEPTION_ACCESS_VIOLATION。要么省略（用默认 `&IFileManager::Get()`），要么显式传 `&IFileManager::Get()`。
+2. token 鉴权是「防本机其他进程乱连」的轻量防护，非强安全（endpoint.json 本机可读）；`DAUNREAL_MCP_ENDPOINT` 未设置时请求不带 token，插件 token 文件写失败时也会自动禁用鉴权（向后兼容）。
+
+## 17. 第七阶段结论：截图回传（已完成 ✅）
+
+- **`screenshot(width=1280, height=720)`**（server 纯 Python，零 C++）：生成唯一文件名 → 触发 `unreal.AutomationLibrary.take_high_res_screenshot(w, h, fn)` → 打印 `unreal.Paths.screen_shot_dir()` 解析目录 → 轮询文件落盘（10s 超时）→ 返回 `Image(path)`。
+- **图片回传**：mcp 2.0 的 `Image(path).to_image_content()` 自动转 `ImageContent(type="image", data=base64, mime_type="image/png")`（`func_metadata._convert_to_content` 支持 Image helper）；客户端直接显示。
+- **验证**：真机截图返回 image content（1413912 base64，PNG 魔数）；失败容错（连接失败返回 ERROR 文本不崩溃）；三套测试 12+41+18 回归全绿；selftest tools 现 5 个。
+
+### 关键坑（第七阶段新增）
+1. **截图命令是 `AutomationLibrary.take_high_res_screenshot`（不是 HighResShot）**：`unreal.HighResShot` 不是 Python 函数（HighResShot 只是 console 命令）；`unreal.AutomationLibrary.take_high_res_screenshot(res_x, res_y, filename)` 是 `UAutomationBlueprintFunctionLibrary` 的 Python 别名，截图存到 `unreal.Paths.screen_shot_dir()`（`Saved/Screenshots/WindowsEditor/`），默认 `force_game_view=True` 在编辑器态可用。
+2. **双编辑器进程会导致 token 冲突**：旧进程占端口 + 新进程写新 endpoint.json，server 读到新 token 却被旧进程拒（unauthorized）。单实例前提（用户明确）下，切进程要确保先杀干净（`tasklist //FI "IMAGENAME eq UnrealEditor.exe"` 确认无残留）再启。
+
+## 17. QA 复审（2026-08-17，发现并修复 2 个真实缺陷）
+
+对第三、四阶段成果做独立 QA（32 项纯 CPython 对抗性用例 + 18 项 UE 5.5.4 真机用例），**发现 2 个此前测试未覆盖的真实缺陷，已修复并回归验证**。
+
+### 缺陷 1（较严重）：`_collect_stmt` 缺 `ast.While` 分支 → while 循环体赋值静默丢失
+
+- **现象**：`while` 循环体内的赋值不会进入 `global` 声明，变换后这些变量**不落回共享命名空间**，静默破坏 REPL 持久化。
+  ```python
+  counter = 0
+  while counter < 4:
+      doubled = counter * 2   # <- 变换前生成 global counter, collected（缺 doubled）
+      counter += 1
+  ```
+  实测：原版 ns 有 `doubled=6`，变换后**丢失**。
+- **为什么之前没发现**：`_collect_stmt` 有 `For` 分支但完全没有 `While` 分支；原回归测试的 "while loop" 用例只检查了循环变量本身（`n`），没有检查循环体内新赋的变量。缺陷表现为"少一个变量"而非报错，非常隐蔽。
+- **修复**：补 `ast.While` 分支（递归 body/orelse）。
+
+### 缺陷 2：async 路径未注入 `DA_PRELUDE` → async 脚本用不了 `da.*`
+
+- **现象**：`_run_async` 直接提交 `transformed.setup_code`，不含 `da` helper 定义。新会话（编辑器刚启动 / 刚 `reset_session`）里 async 脚本调 `da.all_actors()` 会 `NameError`。而 `execute_python` 的 docstring 明确宣传了 `da` 可用 —— sync 能用 async 不能用，行为不一致。
+- **修复**：submit 前把 `DA_PRELUDE` 作为**独立请求**执行（不能拼进 `setup_code`：那是 AST 变换的产物，再解析会把 helper 包进 generator 并给其内部循环注入 yield）。prelude 自带 `if "da" not in globals()` 幂等保护，开销可忽略。
+
+### 顺带清理
+
+- `_collect_stmt` / `_inject_stmt` 的 `isinstance(..., ast.Lambda)` 分支是**死代码 + 潜在崩溃点**：`ast.Lambda` 是表达式不是语句（`f = lambda x: x` 解析为 `Assign`），永远不会走到；且 `ast.Lambda` **没有 `.name` 属性**，一旦走到就 `AttributeError`。已移除。
+- walrus 收集原先只扫 `ast.Expr` 内的 `NamedExpr`，漏掉 `while`/`if` 测试式、`for` 迭代式、`with` 上下文式、`match` subject 里的 walrus。已抽出 `_collect_walrus()` 统一处理。
+- 删除未使用的 `_DA_RELEASE_SENTINEL` 常量。
+
+### QA 覆盖范围（供后续回归参考）
+
+- **AST 层 32 项**（`qa_da_async.py`）：for/while + break/continue/else、for-else 有无 break、4 层嵌套、try/finally、`except as e`、with、walrus、comprehension 独立作用域、循环变量泄漏、tuple 解包、下标 augassign、match、用户已有 `global`、全部绑定形式的名字收集、line_map 与 traceback 映射、SyntaxError 透传、空脚本。
+- **真机 18 项**（`qa_fixes_realeditor.py`）：两个修复验证 + async 端到端（da 可用 / progress 通知 / 错误 traceback / 无循环回退）+ job 生命周期（submit/poll/cancel）+ 250 万次迭代期间同步 ping **10–34ms**（编辑器不冻结）+ 未知 job_id 不崩桥。
+
+### 已确认的设计限制（非缺陷，但应写进文档告知用户）
+
+1. **循环在函数内 → `steppable=False`**：`def f(): for ...` 然后 `f()`，顶层无循环，无法分片，回退 sync 执行会阻塞。
+2. **纯 comprehension → `steppable=False`**：`[x for x in range(100000)]` 是独立作用域，不能注入 yield，仍会阻塞游戏线程。
+3. **单条巨型阻塞调用无切点**：如一次 `build_lighting()`，无法分片。
+4. 以上三种情况建议在 `execute_python` docstring 里明说，让 AI 写脚本时把循环放在顶层。（已于第五阶段写入 docstring ✅）
+
+## 18. QA 复审：知识层（2026-08-17，38 项全绿，0 缺陷）
+
+知识层的风险点不是崩溃，而是**内容准确性**——resource 里若写了不存在的 API，会主动误导 AI，比没有知识层更糟。所以本轮 QA 的核心是**把文档里提到的每个类和方法都拿到运行中的 UE 里核对**（`server/test_knowledge_layer.py`，38 项，UE 5.5.4 真机）。
+
+### 事实核对结果（全部通过）
+
+| 核对项 | 方法 | 结果 |
+|---|---|---|
+| `daunreal://subsystems` 的 9 个 Subsystem 类 | `hasattr(unreal, cls)` | **0 处不存在** |
+| 同资源里声明的 **40 个方法** | `method in dir(cls)` 逐一比对 | **0 处不存在** |
+| `daunreal://deprecated-api` 的 4 个旧类 + 6 个新类 | 双侧 `hasattr` | 全部存在 |
+| 7 组旧→新方法映射（spot-check） | 两侧 `dir()` 均需命中 | 全部解析成功 |
+| `daunreal://conventions` 声明的 7 个 `da.*` helper | `hasattr(da, m)` | 全部存在 |
+| `batch-process-assets` 模板 | 原样执行 | 遍历 **7349** 个资产，`load_asset` 成功 |
+| `scene-inspection` 模板 | 原样执行 | 输出 **138** actor + `da.dumps` 正常 |
+| 已记录的坑「`AssetData` 无 `object_path`」 | `hasattr` | 仍然成立 ✅ |
+
+### MCP 表面与工具行为
+
+- `initialize` 正确宣告 `resources` / `prompts` capability；`resources/list`+`read`、`prompts/list`+`get`、`tools/list` 全部可用。
+- 工具数仍为 **4**（execute_python / python_help / python_search / reset_session），保持精简定位。
+- `python_search`：命中、大小写不敏感、未命中回 `(none)` 而非报错、宽泛搜索（`"a"` 命中 6814 类）**正确截断且输出仅 1534 字符**（不会灌爆上下文）、文档声明的「方法名搜不到」限制成立。
+
+### 新增契约验证（本轮补的用例）
+
+- **`reset_session` 可重复调用**：其实现依赖 `da.reset()`，若 `da` 把自己删掉则第二次调用会 `NameError`。实测 `da` 与 `unreal` 在 reset 后均保留、用户变量被清空 ✅
+
+### QA 方法论踩坑（写给下次的自己）
+
+- **`da` 只在 `execute_python` 路径注入**（`_run(code)` 默认 `prelude=True`）。直连 TCP 桥接测 `da.*` 会得到 `NameError`——那是**测试方法错**，不是产品缺陷。要测 `da` 必须自己拼 `DA_PRELUDE`（`test_knowledge_layer.py` 里的 `call_with_prelude()`）。
+- `python_help` / `python_search` 走 `prelude=False`，它们只用 `unreal` 与内建，不依赖 `da`，符合设计。
+- 从插件回传的日志行**带 `\r`**（`log` 里是 `\r\n`），用 `startswith("MARKER:")` 取值后必须 `.strip()`，否则 `== "NONE"` 恒为假，产生一批假 FAIL。
+- 用正则从 markdown 抓类名时注意占位符：`unreal.<Subsystem>` 会被 `(\w*Subsystem)` 抓成裸词 `Subsystem`，需排除。
+
+### 文档修正
+
+- 原有两个章节都编号为「## 15」（知识层、QA 复审），已把后者改为「## 16」，本节为「## 17」。
+
+## 19. QA 复审：第六阶段安全层（2026-08-17，发现并修复 5 个缺陷 + 1 处测试基建断裂）
+
+对 dry_run / token 鉴权 / 审计日志做对抗性 QA（85 项：47 项纯 Python + 38 项 UE 5.5.4 真机）。
+安全功能的 QA 原则是**尝试绕过**，而不是确认 happy path。
+
+### 缺陷 1（安全，已修复）：token 比较大小写不敏感
+
+- **现象**：token 是全大写 GUID（`D192D547-...`），但**小写版本同样被接受**。
+  实测 `exact` / `UPPER` / `lower` 三种写法全部 `ok=True`。
+- **根因**：`FString::operator==` 在 UE 里是**大小写不敏感**的。直接 `Token == AuthToken`
+  让 GUID 的十六进制字母位 A↔a 等价，凭空缩小猜测空间。
+- **修复**：改用 `Token.Equals(AuthToken, ESearchCase::CaseSensitive)`；并把
+  `GetStringField` 换成 `TryGetStringField`（字段缺失时明确返回 false，不依赖默认值行为）。
+
+### 缺陷 2（健壮性，已修复）：`da` prelude 无法自愈，坏了只能重启编辑器
+
+- **现象**：prelude 的守卫是 `if "da" not in globals()`。一旦 `da` 存在但它依赖的
+  模块级私有名（`_da_json`）丢失，守卫短路 → **重新注入也修不回来**，`da.dumps`
+  从此永久 `NameError`，唯一出路是重启编辑器。
+- **修复**：① 守卫改为**完整性探测**（真的调一次 `da.dumps({"_":1})`，异常即重建）；
+  ② `dumps` 改用函数内 `import json as _j`，不再依赖模块级私有名。
+- **验证**：删掉 `_da_json` 后 `dumps` 仍正常（本地 import 免疫）；把 `da` 换成 `None`
+  后重新注入能自动重建 ✅
+
+### 缺陷 3（健壮性，已修复）：`reset()` 同样依赖易失的模块级名
+
+- 上面修好 `dumps` 对 `_da_json` 的依赖后，**同类问题在 `reset()` 复现**：它依赖
+  `_da_protected`，删掉后 `da.reset()` 永久 `NameError`。而当时的完整性守卫只探测
+  `dumps`，所以检测不到 `reset` 已损坏。
+- 这暴露了一个模式：**只要 helper 依赖模块级私有名，就存在同一类脆弱性**。
+- 修复：`_da_protected` 的快照改存到类属性 `_Da._protected`（不在 globals 里，不会被
+  清理逻辑误删）；完整性守卫同时校验 `dumps` 可用 **且** `_Da._protected` 是 set。
+- **验证 5 种损坏场景全部自愈**：删 `_da_protected` / 删 `_da_json` / `da` 换成坏对象 /
+  `da` 整个删除 / 连续 reset 两次 —— 全部 ok ✅
+- 附带修掉一个测试污染问题：此前 security 套件跑完会让 knowledge 套件挂 3 项，
+  现在按任意顺序连续跑六套都全绿。
+
+### 缺陷 4（健壮性，已修复）：`_load_token` 只捕获 `OSError`
+
+- 半写入 / 被截断的 `endpoint.json`（编辑器启动那一瞬就是这个状态）会抛
+  `json.JSONDecodeError`（`ValueError` 子类），逃出 except → **每个请求都炸**。
+- 修复：捕获 `(OSError, ValueError, UnicodeDecodeError)` 并校验顶层是 dict，
+  任何异常都降级为「无 token」而非抛出。
+
+### 缺陷 5（可维护性，已修复）：审计日志无大小上限
+
+- 单条 28896 字符原样落盘。`history.jsonl` 是 append-only，长期无界增长，
+  且把脚本里的字符串逐字留在磁盘上。
+- 修复：`LogHistory` 对 `code` / `error` 各截断到 4000 字符并标注
+  `... [truncated, N chars total]`。实测 28896 → 4034 ✅
+
+### 测试基建断裂（重要教训）
+
+鉴权上线后，**两个既有真机套件大面积失败**（`test_knowledge_layer.py` 19/38 fail、
+`test_async_realeditor.py` 9/18 fail），因为它们直连桥接不带 token。这不是产品缺陷，
+但不修的话，以后每轮 QA 都会被假 FAIL 淹没。
+
+- 修复：两个套件加 `_auth_token()`（按 `DAUNREAL_MCP_ENDPOINT` → 项目 `Saved/` 顺序解析，
+  并**校验 endpoint.json 里的 port 与被测端口一致**），在 `raw()` 里统一注入；
+  spawn 的 stdio server 子进程也补 `DAUNREAL_MCP_ENDPOINT`。
+- **教训：新增鉴权 / 协议字段时，必须同步升级所有既有测试套件**，否则测试资产会静默腐化。
+
+### dry_run 覆盖面补强（19 个漏报 → 0）
+
+原 `DRY_RUN_DANGEROUS` 只有约 20 个名字，实测 **19/19 个变更类操作漏报**：
+
+- 变换类：`set_actor_location` / `set_actor_transform` / `set_actor_rotation` /
+  `set_actor_scale3d`（悄悄移动东西，肉眼最难发现）
+- 关卡类：`new_level` / `load_level`（**丢弃未保存改动**）/ `save_current_level` /
+  `save_all_dirty_levels`
+- 资产类：`make_directory` / `rename_directory` / `create_asset` / `import_asset_tasks`
+- 其他：`delete_actor` / `destroy_component` / `attach_to_actor` / `build_light_maps` /
+  `editor_request_begin_play`（启动 PIE）/ undo-redo
+
+并补上**逃逸手段的显式披露**（原先 7/8 完全静默通过）：
+
+- 新增 `DRY_RUN_OPAQUE`（`eval` / `exec` / `getattr` / `__import__` 等动态派发）→
+  风险标为 **UNKNOWN**，不再冒充 MEDIUM。
+- 新增 `DRY_RUN_EXTERNAL`（`os.remove` / `shutil.rmtree` / `subprocess` 等 unreal
+  之外的破坏）→ 风险 HIGH，单独一节列出。
+- 报告结尾固定附上「name-based heuristic, **not a sandbox**」告知；docstring 同步写明
+  「a clean dry-run report is not a guarantee」，避免 AI 过度信任。
+
+### 已验证的正确行为（真机）
+
+- dry_run **完全不接触 bridge**（spy 拦截到 0 请求）、无本地副作用、**不写审计日志**；
+  destroy-all 脚本 dry_run 后 actor 数 138 → 138 未变。
+- 鉴权覆盖**所有 action**：execute / poll / cancel / async submit，无 token 一律 unauthorized。
+- 空 token、错 token、截断 token 均被拒；缺 `code` 字段等畸形请求不崩桥。
+- 审计日志：成功与失败都记录，失败带 error；async 记录的是**原始 code 而非变换后的
+  generator**；中文不乱码；每行均为合法 JSON。
+- server 通过 `DAUNREAL_MCP_ENDPOINT` 自动鉴权；不设该变量时确实拿到 unauthorized
+  （证明鉴权真的在生效，而不是恰好都放行）。
+
+### 保留的观察项（非缺陷）
+
+- 风险分级里「任何调用 → MEDIUM」，所以纯读脚本也是 MEDIUM。真正有区分度的是
+  HIGH / UNKNOWN 与其余，LOW 仅在完全无调用时出现。够用，暂不改。
+
+### 测试套件现状：六套 194 项全绿
+
+| 套件 | 需编辑器 | 项数 |
+|---|---|---|
+| `test_ast_transform.py` | no | 12 |
+| `test_da_async_edgecases.py` | no | 41 |
+| `test_dryrun_token.py` | no | 47 |
+| `test_knowledge_layer.py` | yes | 38 |
+| `test_async_realeditor.py` | yes | 18 |
+| `test_security_realeditor.py` | yes | 38 |
+
+真机套件用 `DAUNREAL_MCP_PORT` 选端口，并会自动按端口匹配对应工程的 `endpoint.json`
+（8765 = 5.4 工程，8766 = 5.5 工程）。
+
+## 20. 环境事实：UE 5.5 Python 反射限制（2026-08-18 实测）
+
+用 `execute_python` 直通在 5.5.4 实测「蓝图 / UMG 资产创建」的边界，结论记录如下
+（避免后续再用 5.4 时代的写法）：
+
+| 能力 | 5.5 实测结果 |
+|---|---|
+| 创建蓝图资产（`BlueprintFactory` + `parent_class`） | ✅ `create_asset` → `compile_blueprint` → `save_asset` → `generated_class()` 生成 `*_C` |
+| 蓝图成员变量（`BlueprintEditorLibrary.add_member_variable`） | ❌ 需要属性类对象，但 **5.5 已从 `unreal` 模块移除基础 Property 类**（`IntProperty/FloatProperty/StrProperty/BoolProperty/DoubleProperty/ByteProperty/Int64Property` 全部 `hasattr==False`） |
+| 创建 UMG 资产（`WidgetBlueprintFactory`） | ✅ 资产本身能创建 |
+| UMG 设计时树（往 WidgetBlueprint 加控件） | ❌ `wb.widget_tree` 不存在；`get_editor_property("WidgetTree")` → **protected**；`unreal.WidgetTree` 顶层类不存在；`unreal_editor` 模块不可用 |
+| 运行时 UI（PIE） | ✅ `WidgetBlueprintLibrary.create_widget` 等运行时 API 可用（但非设计时资产） |
+
+结论：
+- **蓝图**：Python 直通能创建/编译/保存，但加不了成员变量（属性类被移除）。
+- **UMG**：设计时控件树在 5.5 的 Python 反射里被封死，纯 Python 无法填充。
+- 替代方案：a) 在本插件 C++ 侧加一个「widget tree 填充 / 蓝图变量添加」action（插件本来就是传输壳，加 action 不违反架构）；b) 在 5.4 工程实测反射是否放开（未验证）；c) 运行时 UI 走 PIE。
+- 另一个环境事实：**编辑器每次重启会重新生成 token**（endpoint.json 重写），直连脚本要重读；server 侧按 mtime 缓存自动适配，无影响。
+
+## 21. 第八阶段：EUW / UMG Helper 落地（已完成 ✅）
+
+- **背景**：在 UE 5.5 中通过 Python 构建 Editor Utility Widget (EUW) 时，资产创建、子控件添加、布局、样式、事件绑定、编译与弹窗全通，唯独 `UWidgetTree::RootWidget` 和 `UWidget::bIsVariable` 在 Python 侧为 protected / 未导出。
+- **C++ Helper（`UDAUMGHelper`）**：
+  - `SetWidgetTreeRoot(UWidgetTree* Tree, UWidget* RootWidget)` — 解决根控件无法设置导致子控件被 GC 回收的关键痛点。
+  - `SetWidgetIsVariable(UWidget* Widget, bool bIsVariable = true)` — 解决控件无法在蓝图中标记为变量的问题。
+  - `GetAllWidgets(UWidgetTree* Tree)` — 遍历获取控件树全部控件。
+  - 依赖模块：`UMG`、`UMGEditor`。
+- **Python 封装**：`DA_PRELUDE` 注入 `da.set_root(tree, root)` 与 `da.set_variable(widget, is_var=True)`；并在 `daunreal://conventions` 资源中建立文档。
+- **验证**：部署到 `DAUNrealTest55` 并通过 UE 5.5 UBT 编译通过（0 error, 0 warning）。

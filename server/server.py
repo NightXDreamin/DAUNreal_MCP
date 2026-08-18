@@ -136,6 +136,20 @@ if not _da_ok:
                     continue
                 del globals()[_k]
 
+        @staticmethod
+        def set_root(tree, root):
+            import unreal
+            if hasattr(unreal, "DAUMGHelper"):
+                return unreal.DAUMGHelper.set_widget_tree_root(tree, root)
+            raise RuntimeError("unreal.DAUMGHelper is not available. Ensure DAUnrealMCP plugin is loaded.")
+
+        @staticmethod
+        def set_variable(widget, is_variable=True):
+            import unreal
+            if hasattr(unreal, "DAUMGHelper"):
+                return unreal.DAUMGHelper.set_widget_is_variable(widget, is_variable)
+            raise RuntimeError("unreal.DAUMGHelper is not available. Ensure DAUnrealMCP plugin is loaded.")
+
     da = _Da()
     _da_protected.update(("_Da", "da", "_da_json", "_da_protected", "unreal"))
     _Da._protected = set(_da_protected)
@@ -769,6 +783,7 @@ def conventions_resource() -> str:
   - `da.dump(obj, depth=3)` / `da.dumps(obj, depth=3)` — UObject/struct/数组 → dict/JSON
   - `da.u(path)` 加载资产；`da.cls(name)` 加载类
   - `da.selected()` / `da.all_actors()` — 当前选择 / 全部关卡 actor
+  - `da.set_root(tree, root)` / `da.set_variable(widget, is_var)` — EUW / UMG 控件树根节点与变量标记
   - `da.reset()` — 清空用户变量（保留 `unreal` 和 `da`）
 - **REPL 持久化**：变量与 `import` 跨 `execute_python` 调用保留。
 - **输出**：用 `print(...)` 返回结果。

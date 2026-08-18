@@ -12,7 +12,11 @@ public class DAUnrealMCP : ModuleRules
 		{
 			"Core",
 			"CoreUObject",
-			"Engine"
+			"Engine",
+			"Slate",
+			"SlateCore",
+			"InputCore",
+			"ToolMenus"
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[]
@@ -22,7 +26,9 @@ public class DAUnrealMCP : ModuleRules
 			"Json",
 			"JsonUtilities",
 			"PythonScriptPlugin",
-			"UnrealEd"
+			"UnrealEd",
+			"UMG",
+			"UMGEditor"
 		});
 	}
 }

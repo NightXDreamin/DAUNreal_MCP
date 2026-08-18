@@ -76,6 +76,15 @@ public:
 	bool Start(int32 InPort);
 	void Shutdown();
 
+	/** Current listening port (last value passed to Start). */
+	int32 GetPort() const { return Port; }
+
+	/** True if an auth token is active. */
+	bool HasAuthToken() const { return !AuthToken.IsEmpty(); }
+
+	/** True while the worker thread + listener are up and accepting connections. */
+	bool IsRunning() const { return (bool)bRunning && Thread != nullptr && ListenerSocket != nullptr; }
+
 	// FRunnable
 	virtual uint32 Run() override;
 	virtual void Exit() override {}

@@ -173,7 +173,7 @@ try:
     tools = [t["name"] for t in recv(rid)["result"]["tools"]]
     print("   tools:", tools)
     check("python_search registered", "python_search" in tools, str(tools))
-    check("tool count is 4 (still a lean surface)", len(tools) == 4, f"{len(tools)}: {tools}")
+    check("tool count is 5 (still a lean surface)", len(tools) == 5, f"{len(tools)}: {tools}")
 
     rid = send("resources/list", {})
     res = recv(rid)["result"]["resources"]
