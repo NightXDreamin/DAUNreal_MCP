@@ -28,7 +28,9 @@ public class DAUnrealMCP : ModuleRules
 			"PythonScriptPlugin",
 			"UnrealEd",
 			"UMG",
-			"UMGEditor"
+			"UMGEditor",
+			"AssetTools",
+			"Kismet"
 		});
 	}
 }

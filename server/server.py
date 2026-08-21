@@ -286,6 +286,12 @@ class UEBridge:
     def cancel(self, job_id: int) -> dict:
         return self._request({"action": "cancel", "job_id": job_id})
 
+    def import_assets(self, tasks: list[dict]) -> dict:
+        return self._request({"action": "import_assets", "tasks": tasks})
+
+    def compile_assets(self, paths: list[str]) -> dict:
+        return self._request({"action": "compile_assets", "paths": paths})
+
 
 bridge = UEBridge()
 
@@ -560,6 +566,78 @@ async def execute_python(code: str, ctx: Context, mode: str = "sync", dry_run: b
     if mode != "async":
         return _format(_run(code))
     return await _run_async(code, ctx)
+
+
+async def _run_native_job(submit_resp: dict, ctx: Context, timeout_s: float, what: str) -> str:
+    """Shared submit->poll loop for native jobs (import/compile).
+
+    The editor executes these from its FTSTicker tick (not the request callback
+    stack), which is what makes Interchange imports and blueprint compiles safe
+    to run via MCP. Returns a plain-text report.
+    """
+    if not submit_resp.get("ok"):
+        return f"ERROR: {submit_resp.get('error', f'{what} submit failed')}"
+    job_id = submit_resp.get("job_id")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    try:
+        while True:
+            await asyncio.sleep(POLL_INTERVAL)
+            p = bridge.poll(job_id)
+            if not p.get("ok"):
+                return f"ERROR: {p.get('error', 'poll failed')}"
+            status = p.get("status")
+            if status == "done":
+                output = (p.get("output") or "").strip()
+                return f"OK\n{output}".rstrip() if output else "OK"
+            if status == "error":
+                return f"ERROR: {p.get('error') or 'unknown error'}"
+            if status == "cancelled":
+                return "CANCELLED"
+            if loop.time() > deadline:
+                bridge.cancel(job_id)
+                return f"ERROR: {what} timed out and was cancelled"
+    except asyncio.CancelledError:
+        with anyio.CancelScope(shield=True):
+            bridge.cancel(job_id)
+        return "CANCELLED"
+
+
+@server.tool()
+async def import_assets(ctx: Context, tasks: list[dict], timeout_s: float = 900.0) -> str:
+    """Import external asset files (FBX / OBJ / textures / etc.) into the project.
+
+    Each task: ``{"filename": "C:/path/file.fbx", "destination_path": "/Game/Folder"}``
+    (``destination_path`` defaults to ``/Game`` when omitted). Import runs on the
+    editor's tick so Interchange imports complete safely (a plain
+    ``execute_python`` call would crash the editor — see PROGRESS.md §21/22).
+
+    Returns one line per file: ``ok: /Game/...`` or ``error: ...``.
+
+    Example:
+      import_assets([{"filename": "C:/tmp/char.fbx", "destination_path": "/Game/Chars"}])
+    """
+    if not tasks:
+        return "Error: tasks is empty (each: filename + optional destination_path)."
+    resp = bridge.import_assets(tasks)
+    return await _run_native_job(resp, ctx, timeout_s, "import")
+
+
+@server.tool()
+async def compile_assets(ctx: Context, paths: list[str], timeout_s: float = 900.0) -> str:
+    """Compile blueprint assets by package path.
+
+    Compilation runs on the editor's tick, which avoids the game-thread
+    FlushRenderingCommands deadlock that a direct ``execute_python`` compile
+    triggers. Returns one line per asset: ``ok: /Game/...`` or ``error: ...``.
+
+    Example:
+      compile_assets(["/Game/Characters/MyBP.MyBP"])
+    """
+    if not paths:
+        return "Error: paths is empty (blueprint asset paths)."
+    resp = bridge.compile_assets(paths)
+    return await _run_native_job(resp, ctx, timeout_s, "compile")
 
 
 @server.tool()

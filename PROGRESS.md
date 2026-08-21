@@ -406,6 +406,49 @@ powershell -ExecutionPolicy Bypass -File C:\Users\qingpulou\Documents\GitHub\DAU
 - 替代方案：a) 在本插件 C++ 侧加一个「widget tree 填充 / 蓝图变量添加」action（插件本来就是传输壳，加 action 不违反架构）；b) 在 5.4 工程实测反射是否放开（未验证）；c) 运行时 UI 走 PIE。
 - 另一个环境事实：**编辑器每次重启会重新生成 token**（endpoint.json 重写），直连脚本要重读；server 侧按 mtime 缓存自动适配，无影响。
 
+## 21. 环境事实：游戏线程同步导入资产 → TaskGraph 断言崩溃（2026-08-19 实测）
+
+`execute_python` 在**游戏线程**执行脚本。在此线程内调用
+`AssetToolsHelpers.get_asset_tools().import_asset_tasks([...])` 导入 FBX 会触发：
+
+```
+LogInterchangeEngine: Display: Interchange start importing source [...]
+LogWindows: Error: appError called: Assertion failed: ++Queue(QueueIndex).RecursionGuard == 1
+[File:...\TaskGraph.cpp] [Line: 677]
+```
+
+**编辑器直接崩溃**（两次验证：默认路径与 `FbxImportUI` legacy options 均如此——5.5 里 AssetImportTask 一律走 Interchange）。
+根因：Interchange 导入流程内部向 TaskGraph 派发任务并**同步等待**，在游戏线程内同步等待任务图任务 → 递归入队断言。
+尝试过的替代：
+- `FbxImportUI`/`FbxFactory` legacy options → 仍走 Interchange，同样崩溃。
+- `InterchangeManager.scripted_import_asset_async` → 存在但参数结构体 `InterchangeImportAssetParameters` 未暴露给 Python，无法构造调用。
+
+**结论/约定**：MCP 直通**不做资产导入**。FBX 等导入由用户在 Content Browser 手动拖入（iwiki SOP 本来就是这么写的）；MCP 负责导入后的资产构建/生成/验证流程。若未来要脚本化导入，需在插件 C++ 侧加一个「后台线程执行导入」的 action（传输壳加 action 不违反架构）。
+
+## 22. 反射通道验证 + 生成类操作死锁边界（2026-08-19 实测）
+
+**反射通道（`unreal.UObject.call_method`）实测结论**：
+- `atf.call_method("GetRelatedAssets")` 成功调用 **Python stub 未暴露的 static 非 BlueprintCallable** 函数（AudioToolFunctions），返回 5 个关联资产 ✅
+- 二进制引擎（Launcher 版 5.5.4）可用，无需源码（UClass 反射元数据是运行时数据）✅
+- 两种形式都 OK：`call_method("Name")` 与 `call_method("Name", (), {})`
+- **settings 跨 execute_python 调用持久性**：此前"跨调用丢失"实为 AssetData 查询用了无后缀路径（写入的就是无效数据）；`get_asset_by_object_path` 必须传完整路径 `/Game/X.X`。完整路径 set 后 + `GetRelatedAssets` 内部 `GetMutableDefault` 写入均跨调用保留 ✅
+- `GetRelatedAssets` 自动填充 `skeletonRelatedAssets`（省去手动 set 绕路）
+
+**生成类操作死锁边界修正（重要）**：
+- 之前判定 `generate_pose_asset` 稳定安全——**错误**。本次 `call_method("GeneratePoseAsset")` 触发 `FlushRenderingCommands called recursively` **死锁**（成功 3 次后第 4 次死锁，概率性）。
+- **规律**：凡涉及「创建资产 + 内部渲染/预览刷新」（PoseAsset 创建、蓝图编译）的操作，在游戏线程都有死锁风险，只是概率不同（导入=必崩，编译=高概率，资产创建=低概率）。
+- 弹窗坑：`CheckSlected` 优先读 **Content Browser 选区**，选区有 1 个非目标类型资产就弹模态窗卡死游戏线程（"Please select the asset type of..."）。**约定：调 AudioToolFunctions 走 CheckSlected 的函数前必须先 `sync_browser_to_objects([])` 清选区**；且超时断连的脚本会在编辑器里继续执行，弹窗关闭后会继续跑到死锁——杀进程前先看日志确认。
+
+**架构方向更新**：与其为导入/编译各写专用 action，不如做一个**通用后台执行 action（`run_worker`）**——把任意脚本调度到插件专用工作线程执行（游戏线程不阻塞），一个 action 覆盖全部"生成类/线程敏感"操作。风险：unreal API 在非游戏线程的线程安全性需实验验证（Interchange 导入与蓝图编译官方支持后台，普通 API 部分线程安全）。待验证：工作线程执行 unreal Python 的最小实验。
+
+**run_worker 最小实验结论（2026-08-19）：方案不可行**：
+- 在 `execute_python` 内用 `threading.Thread` 起 Python 线程调 unreal API：`unreal.load_asset` 在非游戏线程**返回 None**（加载依赖游戏线程泵），`AssetRegistryHelpers` 也不可用——**unreal Python 绑定大量依赖游戏线程上下文**，通用"后台跑任意 Python"路线证伪。
+- **最终架构定稿**：线程问题必须走 **C++ 专用 action**（引擎原生线程模型，不依赖 Python 线程）：
+  - `import_assets`：C++ 调 Interchange 异步导入
+  - `compile_assets`：C++ 后台编译蓝图（可并入 PoseAsset 等"生成类"——C++ 侧从后台线程调 CoreLink 创建资产，渲染 flush 是正常等待）
+  - 反射通道（`call_method`）保留：解决 stub 可见性（只读/设置类操作零 C++）
+- 定位：MCP = execute_python（常规/反射）+ 2 个 C++ 线程封装 action；action 数稳定不膨胀。
+
 ## 21. 第八阶段：EUW / UMG Helper 落地（已完成 ✅）
 
 - **背景**：在 UE 5.5 中通过 Python 构建 Editor Utility Widget (EUW) 时，资产创建、子控件添加、布局、样式、事件绑定、编译与弹窗全通，唯独 `UWidgetTree::RootWidget` 和 `UWidget::bIsVariable` 在 Python 侧为 protected / 未导出。
@@ -416,3 +459,21 @@ powershell -ExecutionPolicy Bypass -File C:\Users\qingpulou\Documents\GitHub\DAU
   - 依赖模块：`UMG`、`UMGEditor`。
 - **Python 封装**：`DA_PRELUDE` 注入 `da.set_root(tree, root)` 与 `da.set_variable(widget, is_var=True)`；并在 `daunreal://conventions` 资源中建立文档。
 - **验证**：部署到 `DAUNrealTest55` 并通过 UE 5.5 UBT 编译通过（0 error, 0 warning）。
+
+## 23. 原生 job：import_assets / compile_assets（2026-08-19 已实现并实测通过 ✅）
+
+**问题**：Interchange 导入在游戏线程请求回调栈崩溃（§21），蓝图编译死锁（§22），`run_worker` 后台线程方案被实验证伪（unreal Python 绑定依赖游戏线程，§22）。
+
+**方案落地**：原生 job 在 **FTSTicker tick 回调**执行（非 TaskGraph 任务上下文），复用现有 job 表 + poll：
+- `FDaMCPJob` 加 `Kind`（Python/Import/Compile）+ ImportFilenames/ImportDestinations/CompilePaths/NativeResults
+- `SubmitNativeJob` / `RunNativeJob`（tick 里跑）`HasRunningJob`
+- 协议：`{"action":"import_assets","tasks":[{"filename","destination_path"}]}` 与 `{"action":"compile_assets","paths":[...]}` → 返回 job_id → 复用 poll/cancel
+- C++ 实现：Import 用 `UAssetImportTask` + `IAssetTools::ImportAssetTasks`（**5.5 无 bImportSucceeded，用 `GetObjects().Num()>0` 判成功**）；Compile 用 `FKismetEditorUtilities::CompileBlueprint`
+- Build.cs 加 `AssetTools`、`Kismet` 依赖
+- server.py：注册 `import_assets` / `compile_assets` 工具 + `_run_native_job` submit→poll 封装
+
+**实测（UE 5.5.4 真机）**：
+- `compile_assets` 编译 AnimBlueprint：submit → 1 次 poll 即 done → `ok: /Game/...` → **编辑器存活**
+- `import_assets` 导入 Rajesh skeleton.fbx → 3s done → 17 材质 + Skeleton/Mesh/PhysicsAsset 全部落盘 `/Game/RajeshImport/` → **编辑器存活**
+
+**关键验证**：tick 栈（非 AsyncTask(GameThread) 请求回调栈）执行 Interchange 导入与蓝图编译均不再崩溃/死锁 —— TaskGraph 同步等待与 FlushRenderingCommands 在正常 tick 上下文是安全的。**之前"必须手动拖入 FBX / 手动生成蓝图"的两步现在可全托管。**

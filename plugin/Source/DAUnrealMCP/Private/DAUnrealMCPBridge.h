@@ -29,18 +29,42 @@ enum class EDaMCPJobState
 	Cancelled,
 };
 
+/** What kind of work a job performs. */
+enum class EDaMCPJobKind
+{
+	/** Python generator driven by FTSTicker (existing async mode). */
+	Python,
+	/** Asset import via AssetTools/Interchange, executed from the tick. */
+	Import,
+	/** Blueprint compilation, executed from the tick. */
+	Compile,
+};
+
 /**
- * One async job: drives the transformed generator (server/da_async.py) on the
- * game thread via FTSTicker — one time-budgeted step per tick — so long batch
- * scripts no longer freeze the editor. The step script prints a
- * "DA_MCP_STATE|{state}|{slices}" line that we parse into job state.
+ * One async job. Two flavours:
+ *  - Python: drives the transformed generator (server/da_async.py) on the game
+ *    thread via FTSTicker — one time-budgeted step per tick.
+ *  - Import/Compile: heavy editor operations that CANNOT run inside the request
+ *    callback stack (game thread inside AsyncTask(GameThread) → TaskGraph
+ *    recursion / FlushRenderingCommands deadlock). They are executed from the
+ *    normal FTSTicker tick instead, which is not a TaskGraph task context, so
+ *    TaskGraph waits and render flushes complete normally.
  */
 struct FDaMCPJob
 {
 	int32 JobId = 0;
 	EDaMCPJobState State = EDaMCPJobState::Running;
+	EDaMCPJobKind Kind = EDaMCPJobKind::Python;
+	// --- Python flavour ---
 	FString StepCode;     // executed each tick until the job finishes
 	FString CancelCode;   // closes the generator (_da_gen.close())
+	// --- Import flavour ---
+	TArray<FString> ImportFilenames;
+	TArray<FString> ImportDestinations;
+	// --- Compile flavour ---
+	TArray<FString> CompilePaths;
+	// --- shared ---
+	TArray<FString> NativeResults;   // per-item "ok"/"error: ..." (import/compile)
 	FThreadSafeBool bCancelRequested;
 	int32 SlicesDone = 0;
 	FString Error;
@@ -100,6 +124,12 @@ private:
 
 	// --- async jobs ---
 	int32 SubmitAsyncJob(const FString& SetupCode, const FString& StepCode, FString& OutError);
+	int32 SubmitNativeJob(EDaMCPJobKind Kind, const TSharedPtr<FJsonObject>& ReqObj, FString& OutError);
+	/** Execute one import/compile job body. Called from the ticker. Returns true
+	 *  when the job is finished (result in NativeResults/Error). */
+	bool RunNativeJob(FDaMCPJob& Job);
+	/** True if any job is currently Running. */
+	bool HasRunningJob();
 	bool PollJob(int32 JobId, FString& OutStatus, int32& OutSlicesDone, FString& OutError, FString& OutOutput);
 	void RequestCancel(int32 JobId);
 	bool OnGameThreadTick(float DeltaTime);

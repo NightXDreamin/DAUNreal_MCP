@@ -2,15 +2,19 @@
 
 #include "DAUnrealMCPBridge.h"
 
+#include "AssetImportTask.h"
+#include "AssetToolsModule.h"
 #include "Async/Async.h"
 #include "Async/Future.h"
 #include "Containers/StringConv.h"
 #include "Dom/JsonObject.h"
+#include "Engine/Blueprint.h"
 #include "HAL/PlatformMemory.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/FileManager.h"
 #include "Interfaces/IPv4/IPv4Address.h"
 #include "Interfaces/IPv4/IPv4Endpoint.h"
+#include "Kismet2/KismetEditorUtilities.h"
 #include "Misc/DateTime.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Guid.h"
@@ -367,6 +371,39 @@ bool FDAUnrealMCPBridge::ProcessConnection(FSocket* ClientSocket)
 		return true;
 	}
 
+	// --- native job submit: import / compile ---
+	if (Action == TEXT("import_assets") || Action == TEXT("compile_assets"))
+	{
+		const EDaMCPJobKind Kind = (Action == TEXT("import_assets"))
+			? EDaMCPJobKind::Import : EDaMCPJobKind::Compile;
+
+		// Single concurrent job: reject while another job is still running.
+		if (HasRunningJob())
+		{
+			SendErrorResponse(ClientSocket, Id, TEXT("another async job is still running"));
+			ClearActiveSocket();
+			return true;
+		}
+
+		FString SubmitError;
+		const int32 JobId = SubmitNativeJob(Kind, ReqObj, SubmitError);
+		if (JobId < 0)
+		{
+			SendErrorResponse(ClientSocket, Id, SubmitError.IsEmpty() ? TEXT("native job submit failed") : SubmitError);
+			ClearActiveSocket();
+			return true;
+		}
+
+		TSharedRef<FJsonObject> Resp = MakeShareable(new FJsonObject());
+		Resp->SetNumberField(TEXT("id"), Id);
+		Resp->SetBoolField(TEXT("ok"), true);
+		Resp->SetNumberField(TEXT("job_id"), JobId);
+		Resp->SetStringField(TEXT("status"), TEXT("running"));
+		SendLine(ClientSocket, SerializeCondensed(Resp));
+		ClearActiveSocket();
+		return true;
+	}
+
 	// --- execute ---
 	const FString Mode = ReqObj->HasField(TEXT("mode")) ? ReqObj->GetStringField(TEXT("mode")) : TEXT("sync");
 
@@ -561,6 +598,153 @@ int32 FDAUnrealMCPBridge::SubmitAsyncJob(const FString& SetupCode, const FString
 	return Job->JobId;
 }
 
+bool FDAUnrealMCPBridge::HasRunningJob()
+{
+	FScopeLock Lock(&JobLock);
+	for (const auto& KV : Jobs)
+	{
+		if (KV.Value->State == EDaMCPJobState::Running)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+int32 FDAUnrealMCPBridge::SubmitNativeJob(EDaMCPJobKind Kind, const TSharedPtr<FJsonObject>& ReqObj, FString& OutError)
+{
+	CleanupFinishedJobs();
+
+	TSharedPtr<FDaMCPJob> Job = MakeShareable(new FDaMCPJob());
+	Job->JobId = NextJobId++;
+	Job->Kind = Kind;
+
+	if (Kind == EDaMCPJobKind::Import)
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Tasks = nullptr;
+		if (!ReqObj->TryGetArrayField(TEXT("tasks"), Tasks) || Tasks->Num() == 0)
+		{
+			OutError = TEXT("import_assets requires a non-empty 'tasks' array (each: filename + destination_path)");
+			return -1;
+		}
+		for (const TSharedPtr<FJsonValue>& TaskVal : *Tasks)
+		{
+			const TSharedPtr<FJsonObject> Task = TaskVal->AsObject();
+			if (!Task.IsValid())
+			{
+				continue;
+			}
+			const FString Filename = Task->GetStringField(TEXT("filename"));
+			if (Filename.IsEmpty())
+			{
+				continue;
+			}
+			Job->ImportFilenames.Add(Filename);
+			Job->ImportDestinations.Add(Task->HasField(TEXT("destination_path"))
+				? Task->GetStringField(TEXT("destination_path")) : FString());
+		}
+		if (Job->ImportFilenames.Num() == 0)
+		{
+			OutError = TEXT("no valid import tasks");
+			return -1;
+		}
+	}
+	else if (Kind == EDaMCPJobKind::Compile)
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Paths = nullptr;
+		if (!ReqObj->TryGetArrayField(TEXT("paths"), Paths) || Paths->Num() == 0)
+		{
+			OutError = TEXT("compile_assets requires a non-empty 'paths' array of asset paths");
+			return -1;
+		}
+		for (const TSharedPtr<FJsonValue>& PathVal : *Paths)
+		{
+			Job->CompilePaths.Add(PathVal->AsString());
+		}
+	}
+	else
+	{
+		OutError = TEXT("unsupported native job kind");
+		return -1;
+	}
+
+	{
+		FScopeLock Lock(&JobLock);
+		Jobs.Add(Job->JobId, Job);
+	}
+	RegisterTicker();
+	return Job->JobId;
+}
+
+bool FDAUnrealMCPBridge::RunNativeJob(FDaMCPJob& Job)
+{
+	if (Job.Kind == EDaMCPJobKind::Import)
+	{
+		// Executed from the tick (NOT a TaskGraph task context), so Interchange's
+		// internal synchronous TaskGraph waits complete normally instead of
+		// hitting the ++Queue(QueueIndex).RecursionGuard assertion that crashes
+		// when this runs inside the request callback stack.
+		IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
+		TArray<UAssetImportTask*> ImportTasks;
+		ImportTasks.Reserve(Job.ImportFilenames.Num());
+		for (int32 i = 0; i < Job.ImportFilenames.Num(); ++i)
+		{
+			UAssetImportTask* Task = NewObject<UAssetImportTask>();
+			Task->Filename = Job.ImportFilenames[i];
+			Task->DestinationPath = Job.ImportDestinations[i].IsEmpty() ? TEXT("/Game") : Job.ImportDestinations[i];
+			Task->bAutomated = true;
+			Task->bSave = true;
+			Task->bReplaceExisting = true;
+			ImportTasks.Add(Task);
+		}
+		AssetTools.ImportAssetTasks(ImportTasks);
+		for (UAssetImportTask* Task : ImportTasks)
+		{
+			// UE 5.5 UAssetImportTask has no bImportSucceeded flag: success is
+			// indicated by GetObjects() returning the imported assets.
+			if (Task->GetObjects().Num() > 0)
+			{
+				FString Names;
+				for (const FString& P : Task->ImportedObjectPaths)
+				{
+					if (!Names.IsEmpty())
+					{
+						Names += TEXT(",");
+					}
+					Names += P;
+				}
+				Job.NativeResults.Add(Names.IsEmpty() ? TEXT("ok") : TEXT("ok: ") + Names);
+			}
+			else
+			{
+				Job.NativeResults.Add(TEXT("error: import failed for ") + Task->Filename);
+			}
+		}
+		return true;
+	}
+
+	if (Job.Kind == EDaMCPJobKind::Compile)
+	{
+		// Blueprint compilation from the tick: FlushRenderingCommands inside the
+		// compiler completes normally because the game thread is in its normal
+		// tick (no render-thread dependency cycle), unlike the request callback.
+		for (const FString& Path : Job.CompilePaths)
+		{
+			UBlueprint* BP = LoadObject<UBlueprint>(nullptr, *Path);
+			if (!BP)
+			{
+				Job.NativeResults.Add(TEXT("error: cannot load ") + Path);
+				continue;
+			}
+			FKismetEditorUtilities::CompileBlueprint(BP);
+			Job.NativeResults.Add(TEXT("ok: ") + Path);
+		}
+		return true;
+	}
+
+	return true; // Python jobs are driven in OnGameThreadTick directly
+}
+
 bool FDAUnrealMCPBridge::PollJob(int32 JobId, FString& OutStatus, int32& OutSlicesDone, FString& OutError, FString& OutOutput)
 {
 	FScopeLock Lock(&JobLock);
@@ -613,16 +797,43 @@ bool FDAUnrealMCPBridge::OnGameThreadTick(float DeltaTime)
 
 		if (Job->bCancelRequested)
 		{
-			// Already on the game thread: close() raises GeneratorExit at the
-			// suspended yield and runs finally blocks, so the transaction ends
-			// cleanly and already-applied steps remain individually undoable.
-			ExecuteInTransaction(Job->CancelCode);
+			if (Job->Kind == EDaMCPJobKind::Python)
+			{
+				// Already on the game thread: close() raises GeneratorExit at the
+				// suspended yield and runs finally blocks, so the transaction ends
+				// cleanly and already-applied steps remain individually undoable.
+				ExecuteInTransaction(Job->CancelCode);
+			}
 			Job->State = EDaMCPJobState::Cancelled;
 			continue;
 		}
 
-		const FDaMCPExecResult R = ExecuteInTransaction(Job->StepCode);
-		ParseState(R.Log, *Job);
+		if (Job->Kind == EDaMCPJobKind::Python)
+		{
+			const FDaMCPExecResult R = ExecuteInTransaction(Job->StepCode);
+			ParseState(R.Log, *Job);
+		}
+		else
+		{
+			// Import/compile: heavy operation, run once from the tick. Building
+			// one job per tick keeps the editor responsive between jobs.
+			const bool bFinished = RunNativeJob(*Job);
+			if (bFinished)
+			{
+				Job->SlicesDone = 1;
+				FString Out;
+				for (const FString& R : Job->NativeResults)
+				{
+					if (!Out.IsEmpty())
+					{
+						Out += TEXT("\n");
+					}
+					Out += R;
+				}
+				Job->Output = Out;
+				Job->State = EDaMCPJobState::Done;
+			}
+		}
 	}
 
 	bool bAnyRunning = false;
